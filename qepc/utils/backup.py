@@ -10,42 +10,35 @@ import os
 from qepc.autoload import paths
 
 # --- Configuration ---
-# Folders/files to INCLUDE in the backup (relative to project root)
-# This list is exhaustive for all functional parts of the project.
 FILES_TO_INCLUDE = [
-    Path("qepc"),        # Includes ALL code modules
-    Path("notebooks"),    # Includes ALL notebooks
-    Path("data"),         # Includes data/metadata, data/cache, and canonical CSVs (data/raw is filtered out below)
-    Path("main.py"),      # CLI entry point
-    Path("qepc_autoload.py"), # Project shim
-    Path("RESTORE_GUIDE.md"), # Restoration guide
+    Path("qepc"),        
+    Path("notebooks"),    
+    Path("data"),         
+    Path("main.py"),      
+    Path("qepc_autoload.py"), 
+    Path("tools.ipymb"), 
     Path("RESTORE_GUIDE.ipynb"),
-    Path("requirements.txt"), # Dependencies list
-    Path("README.md"),      # Project documentation
-    Path(".gitignore"),     # Version control config
+    Path("requirements.txt"), 
+    Path("README.md"),      
+    Path(".gitignore"),     
 ]
 
-# Paths to EXCLUDE inside the included folders (using starts-with logic on path strings)
-# This prevents the backup from becoming huge due to raw files.
+# CRITICAL FIX: Added 'data/backups' to prevent recursive zipping
 PATHS_TO_EXCLUDE_STR = [
-    "data/raw/",
-    "data/cache/",
+    "data/raw",      # Exclude massive raw data
+    "data/backups",  # Exclude existing zip files
+    "data/cache",
     "__pycache__",
-    ".ipynb_checkpoints"
+    ".ipynb_checkpoints",
+    ".git"
 ]
-
 
 def create_project_backup(verbose: bool = True) -> Path:
-    """
-    Creates a timestamped ZIP archive of the core project structure, excluding raw data.
-    """
     ROOT_DIR = paths.get_project_root()
     BACKUP_DIR = paths.get_backup_dir()
     
-    # 1. Ensure the backup directory exists
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     
-    # 2. Define the output file name
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     zip_filename = f"qepc_backup_{timestamp}.zip"
     zip_path = BACKUP_DIR / zip_filename
@@ -59,55 +52,48 @@ def create_project_backup(verbose: bool = True) -> Path:
                 target_path = ROOT_DIR / target
                 
                 if not target_path.exists():
-                    if verbose:
-                        print(f"   ⚠️ Skipping missing path: {target}")
                     continue
 
                 if target_path.is_file():
-                    # If it's a file, just write it
                     zf.write(target_path, target)
                     continue
 
                 if target_path.is_dir():
-                    # If it's a directory, walk through its contents
                     for dirpath, dirnames, filenames in os.walk(target_path):
                         dirpath = Path(dirpath)
-                        
-                        # Calculate the relative path from the project root
                         rel_dirpath = dirpath.relative_to(ROOT_DIR)
+                        posix_path = rel_dirpath.as_posix()
                         
-                        # Filter out excluded paths
-                        if any(rel_dirpath.as_posix().startswith(ex) for ex in PATHS_TO_EXCLUDE_STR):
-                            dirnames[:] = [] # Stop os.walk from entering excluded dirs
+                        # CHECK: Is this directory in the exclude list?
+                        if any(ex in posix_path for ex in PATHS_TO_EXCLUDE_STR):
+                            if verbose:
+                                # Only print top-level exclusions to avoid spam
+                                if posix_path in PATHS_TO_EXCLUDE_STR:
+                                    print(f"   ⛔ Skipping excluded directory: {posix_path}")
+                            dirnames[:] = [] # Stop walking deeper
                             continue
                         
-                        # Add files in the current directory
+                        # Add files
                         for filename in filenames:
                             full_path = dirpath / filename
                             rel_path = full_path.relative_to(ROOT_DIR)
                             
-                            # Final check against exclusions (e.g., specific files)
-                            if any(rel_path.as_posix().startswith(ex) for ex in PATHS_TO_EXCLUDE_STR):
+                            # Final check for specific file exclusions
+                            if any(ex in rel_path.as_posix() for ex in PATHS_TO_EXCLUDE_STR):
                                 continue
 
                             zf.write(full_path, rel_path)
 
         if verbose:
-            print("✅ Backup successful!")
+            # Verify size
+            size_mb = zip_path.stat().st_size / (1024 * 1024)
+            print(f"✅ Backup successful! Size: {size_mb:.2f} MB")
             
         return zip_path
 
     except Exception as e:
         if verbose:
             print(f"❌ CRITICAL BACKUP FAILURE: {e}")
-        # Clean up failed zip file
         if zip_path.exists():
             os.remove(zip_path)
         raise e
-
-# --- Test function proxy for easy use in new main.py ---
-def auto_backup():
-    try:
-        create_project_backup(verbose=True)
-    except Exception as e:
-        print("Backup failed. Check logs.")
