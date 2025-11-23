@@ -1,3 +1,4 @@
+
 import sys
 from pathlib import Path
 from IPython.display import display, HTML
@@ -15,7 +16,6 @@ except ImportError:
 
 # 2. Visual Step Helper
 def qepc_step(msg: str):
-    """Displays a styled step message in Jupyter."""
     display(HTML(
         f"<div style='font-family:monospace; color:#4ea3ff; font-weight:bold; margin-top:10px;'>"
         f"⧉ QEPC: {msg}</div>"
@@ -30,18 +30,17 @@ try:
     from qepc.sports.nba.player_data import load_raw_player_data
     # Core Modeling Engines
     from qepc.core.lambda_engine import compute_lambda 
-    from qepc.core.simulator import run_qepc_simulation
-    from qepc.sports.nba.player_data import load_raw_player_data
+    from qepc.core.simulator import run_qepc_simulation 
     # Advanced Strengths (V2)
     from qepc.sports.nba.strengths_v2 import calculate_advanced_strengths 
+    # System Diagnostics
+    from qepc.utils.diagnostics import run_system_check 
     
-    # Define primary user proxies (qa.load_games, qa.load_team_stats)
+    # Define primary user proxies 
     load_games = load_nba_schedule 
-    
-    # CRITICAL CHANGE: Redirect qa.load_team_stats to use the advanced calculator!
-    # Note: We are keeping the function name simple for the user.
     load_team_stats = calculate_advanced_strengths 
-
+    run_diagnostics = run_system_check 
+    
 except ImportError as e:
     # CRITICAL: This line and all lines below MUST be indented correctly.
     print(f"[QEPC Autoload] ERROR: Failed to import core functions: {e}")
@@ -55,6 +54,7 @@ except ImportError as e:
     def compute_lambda(schedule, strengths): print("Lambda function missing.")
     def run_qepc_simulation(df, num_trials=20000): print("Simulator function missing.")
     def load_raw_player_data(file_name="PlayerStatistics.csv", usecols=None): print("Raw player data loader missing.")
+    def run_diagnostics(): print("Diagnostics module missing.")
 
 
 # 4. Final Confirmation
