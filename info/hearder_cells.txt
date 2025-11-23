@@ -1,0 +1,42 @@
+# ====================================================================
+# 🛠️ QEPC HEADER PART 1: PATH STABILIZATION
+# ====================================================================
+import os
+import sys
+from pathlib import Path
+
+# Fixes the ModuleNotFoundError by adding the project root to the path.
+notebook_dir = Path(os.getcwd())
+project_root = notebook_dir.parent 
+
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+    print(f"✅ Project root added to path: {project_root}")
+else:
+    print("✅ Project root path already set.")
+    
+print("="*80)
+
+----------------------------------------------------------------------
+----------------------------------------------------------------------
+# ====================================================================
+# 🌌 QEPC HEADER PART 2: AUTOLOAD & FRAMEWORK IMPORTS
+# ====================================================================
+try:
+    import qepc_autoload as qa
+    # Import core components needed for execution
+    from qepc.core.lambda_engine import compute_lambda 
+    from qepc.core.simulator import run_qepc_simulation 
+    
+    # Import numerical libraries for use throughout the notebook
+    import numpy as np 
+    import matplotlib.pyplot as plt 
+    
+    qa.qepc_step("🌌 QEPC Bootstrap Loaded. Environment Ready.")
+except Exception as e:
+    print("❌ CRITICAL ERROR: Autoload failed. Check your project structure and dependencies.")
+    print(e)
+    
+print("="*80)
+
+# --- START NOTEBOOK WORKFLOW BELOW ---
