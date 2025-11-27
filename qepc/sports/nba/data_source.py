@@ -13,27 +13,42 @@ from typing import Optional
 import pandas as pd
 from pathlib import Path
 
+from qepc.sports.nba.strengths_v2 import calculate_advanced_strengths
+
 
 # ---------------------------------------------------------------------------
 # Helpers to detect environment / capabilities
 # ---------------------------------------------------------------------------
-
 def _project_root() -> Path:
     """
-    Try to reuse QEPC's existing project root resolver.
-    Falls back to guessing based on this file's location.
+    Try to find the project root (where the 'data' folder lives).
+
+    This uses:
+        - QEPC_PROJECT_ROOT env var, if set
+        - Otherwise walks up from this file until it finds a 'data' dir
     """
-    try:
-        from qepc.autoload import paths
-        return paths.get_project_root()
-    except Exception:
-        return Path(__file__).resolve().parents[3]
+    env_root = os.environ.get("QEPC_PROJECT_ROOT")
+    if env_root:
+        root = Path(env_root).expanduser().resolve()
+        if (root / "data").exists():
+            return root
+
+    # Fallback: walk upward from this file
+    here = Path(__file__).resolve()
+    for parent in [here] + list(here.parents):
+        if (parent / "data").exists():
+            return parent
+
+    # Last resort: current working directory
+    return Path.cwd().resolve()
 
 
 def nba_api_available() -> bool:
-    """Return True if the nba_api package can be imported."""
+    """
+    Check whether the nba_api package is importable.
+    """
     try:
-        import nba_api  # noqa: F401
+        import nba_api  # type: ignore  # noqa: F401
         return True
     except Exception:
         return False
@@ -41,46 +56,31 @@ def nba_api_available() -> bool:
 
 def online_mode_allowed() -> bool:
     """
-    Decide if we are *allowed* to use online APIs.
+    Check whether QEPC is allowed to use online APIs.
 
-    - If QEPC_OFFLINE=1 (or 'true'), we force offline mode.
-    - Otherwise, we *try* online but still handle failures gracefully.
+    Controlled via env var:
+        QEPC_OFFLINE=1 -> force offline (no nba_api calls)
     """
-    flag = os.environ.get("QEPC_OFFLINE", "").strip().lower()
-    if flag in {"1", "true", "yes"}:
-        return False
-    return True
+    return os.environ.get("QEPC_OFFLINE", "0") != "1"
 
 
 # ---------------------------------------------------------------------------
-# CSV fallback loaders (what you already use today)
+# CSV-based loaders (always available)
 # ---------------------------------------------------------------------------
-
 def load_team_stats_from_csv() -> pd.DataFrame:
     """
-    Load team stats from your existing CSV file.
+    Load team stats from your existing CSV file using the strengths_v2 helper.
 
-    This uses data/Team_Stats.csv, which is already part of your project.
+    This builds team strengths from data/raw/Team_Stats.csv (game-level stats)
+    and returns a DataFrame with columns like:
+        Team, ORtg, DRtg, Pace, Volatility
     """
-    root = _project_root()
-    path = root / "data" / "Team_Stats.csv"
-
-    if not path.exists():
-        raise FileNotFoundError(f"Team_Stats.csv not found at {path}")
-
-    df = pd.read_csv(path)
-    # Basic cleaning to match your existing helper
-    df["Team"] = df["Team"].astype(str)
-    for col in ["ORtg", "DRtg"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    return calculate_advanced_strengths()
 
 
 # ---------------------------------------------------------------------------
 # NBA API loaders (only used when available)
 # ---------------------------------------------------------------------------
-
 def load_team_stats_from_nba_api(season: str = "2024-25") -> Optional[pd.DataFrame]:
     """
     Try to load team stats from the live NBA API via the nba_api package.
@@ -99,48 +99,65 @@ def load_team_stats_from_nba_api(season: str = "2024-25") -> Optional[pd.DataFra
         from nba_api.stats.endpoints import leaguedashteamstats
 
         print(f"[QEPC NBA Data] Fetching team stats from nba_api for season {season}...")
-        endpoint = leaguedashteamstats.LeagueDashTeamStats(
+        resp = leaguedashteamstats.LeagueDashTeamStats(
             season=season,
-            per_mode_detailed="PerGame"
+            per_mode_detailed="PerGame",
+            measure_type_detailed_defense="Base",
         )
-        data = endpoint.get_data_frames()[0]
+        data = resp.get_data_frames()[0]
 
-        # Normalize to something similar to Team_Stats.csv
-        # nba_api uses 'TEAM_NAME', 'OFF_RATING', 'DEF_RATING', etc.
-        cols_map = {
-            "TEAM_NAME": "Team",
-            "OFF_RATING": "ORtg",
-            "DEF_RATING": "DRtg",
-        }
+        # Expect team abbreviation / name and ORtg/DRtg columns
+        # We normalize to your internal schema: Team, ORtg, DRtg
+        df = data.copy()
 
-        for src, dst in cols_map.items():
-            if src not in data.columns:
-                print(f"[QEPC NBA Data] Warning: expected column {src} missing from nba_api response.")
-        df = data.rename(columns=cols_map)
+        # Try to build a nice 'Team' column
+        if "TEAM_NAME" in df.columns:
+            df["Team"] = df["TEAM_NAME"].astype(str)
+        elif "TEAM_ABBREVIATION" in df.columns:
+            df["Team"] = df["TEAM_ABBREVIATION"].astype(str)
+        else:
+            print("[QEPC NBA Data] ERROR: nba_api team stats missing TEAM_NAME/TEAM_ABBREVIATION.")
+            return None
 
-        # Keep only the columns we care about for now
-        keep_cols = [c for c in ["Team", "ORtg", "DRtg"] if c in df.columns]
-        df = df[keep_cols].copy()
+        # NBA API may provide OFF_RATING, DEF_RATING, etc.
+        off_candidates = ["OFF_RATING", "OFFRTG", "OffRtg", "ORtg"]
+        def_candidates = ["DEF_RATING", "DEFRTG", "DefRtg", "DRtg"]
+
+        off_col = next((c for c in off_candidates if c in df.columns), None)
+        def_col = next((c for c in def_candidates if c in df.columns), None)
+
+        if off_col is None or def_col is None:
+            print("[QEPC NBA Data] ERROR: nba_api frame missing clear ORtg/DRtg columns.")
+            return None
+
+        df = df[["Team", off_col, def_col]].copy()
+        df = df.rename(columns={off_col: "ORtg", def_col: "DRtg"})
+
+        # Basic cleaning
+        df["Team"] = df["Team"].astype(str)
+        df["ORtg"] = pd.to_numeric(df["ORtg"], errors="coerce")
+        df["DRtg"] = pd.to_numeric(df["DRtg"], errors="coerce")
 
         print(f"[QEPC NBA Data] Loaded {len(df)} teams from nba_api.")
         return df
 
     except Exception as e:
-        print(f"[QEPC NBA Data] Error while calling nba_api: {e}")
-        print("[QEPC NBA Data] Falling back to CSV.")
+        print(f"[QEPC NBA Data] ERROR during nba_api fetch: {e}")
         return None
 
 
 # ---------------------------------------------------------------------------
-# Public "smart" loader
+# Public API
 # ---------------------------------------------------------------------------
-
-def load_team_stats(prefer_api: bool = True, season: str = "2024-25") -> pd.DataFrame:
+def load_team_stats(
+    season: str = "2024-25",
+    prefer_api: bool = True,
+) -> pd.DataFrame:
     """
-    Smart team stats loader for QEPC.
+    High-level helper for getting team stats.
 
-    Behavior:
-      - If prefer_api is True AND nba_api is installed AND not forced offline:
+    Logic:
+      - If prefer_api is True, nba_api is installed, and online mode is allowed:
             Try nba_api first; if that fails, fall back to CSV.
       - Otherwise:
             Go straight to CSV, no online calls.
