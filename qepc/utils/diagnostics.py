@@ -20,7 +20,8 @@ REQUIRED_FILES: Dict[str, str] = {
     # Core schedule + data
     "Canonical Schedule": "data/Games.csv",
     "Raw Player Stats": "data/raw/PlayerStatistics.csv",
-    "Raw Team Stats": "data/raw/TeamStatistics.csv",
+    # UPDATED: raw team stats now live in data/raw/Team_Stats.csv
+    "Raw Team Stats": "data/raw/Team_Stats.csv",
 
     # Autoload / bootstrapping
     "Autoload Context": "qepc_autoload.py",
@@ -35,13 +36,11 @@ EXPECTED_SCHEMAS: Dict[str, List[str]] = {
     # Canonical schedule
     "data/Games.csv": ["Date", "Time", "Away Team", "Home Team"],
 
-    # Team-level ratings
-    "data/Team_Stats.csv": ["Team", "ORtg", "DRtg"],
-
-    # Raw stats (we just sanity check a couple of key columns)
-    # Your PlayerStatistics.csv uses firstName/lastName, not playerName.
+    # Raw stats sanity checks (just a few key columns)
     "data/raw/PlayerStatistics.csv": ["gameId", "firstName"],
-    "data/raw/TeamStatistics.csv": ["gameId", "teamName"],
+
+    # UPDATED: raw team stats file + minimal required columns
+    "data/raw/Team_Stats.csv": ["gameId", "teamName"],
 }
 
 

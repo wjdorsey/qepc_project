@@ -10,43 +10,64 @@ from qepc.autoload import paths
 from qepc.utils.data_cleaning import standardize_team_name 
 
 # --- Configuration ---
-RAW_TEAM_STATS_FILE = "TeamStatistics.csv"
+# UPDATED: Use your canonical game-level team stats file in data/raw
+RAW_TEAM_STATS_FILE = "Team_Stats.csv"
 FTA_MULTIPLIER = 0.44 
 
 # ACCURACY SETTINGS
-DAYS_HISTORY_WINDOW = 730  # Look back 2 years (approx 2 seasons)
-DECAY_LAMBDA = 0.002       # Decay rate (higher = more recency bias)
+HISTORY_DAYS = 730        # Look back up to 2 seasons
+MIN_GAMES_PER_TEAM = 5    # Minimum games required for stable DRtg
+HALF_LIFE_DAYS = 60       # Time decay half-life (recent games matter more)
 
-def apply_time_decay(df: pd.DataFrame, date_col: str = 'gameDate') -> pd.DataFrame:
+
+# ---------------------------------------------------------------------------
+# Time Decay Helper
+# ---------------------------------------------------------------------------
+def apply_time_decay(df: pd.DataFrame, date_col: str = "gameDate") -> pd.DataFrame:
     """
-    Applies exponential time decay weights to the data.
-    Recent games get Weight ~ 1.0, older games get Weight -> 0.0
+    Apply exponential time decay weights based on gameDate.
+    Newer games get higher weight.
     """
-    # Ensure date is datetime
-    df[date_col] = pd.to_datetime(df[date_col], utc=True, errors='coerce')
+    if date_col not in df.columns:
+        raise ValueError(f"Expected date column '{date_col}' in DataFrame")
+
+    df = df.copy()
     
-    # 1. Filter by Date Window
-    cutoff_date = pd.Timestamp.now(tz='UTC') - timedelta(days=DAYS_HISTORY_WINDOW)
+    # Ensure datetime
+    df[date_col] = pd.to_datetime(df[date_col], utc=True, errors="coerce")
+    df = df.dropna(subset=[date_col])
+
+    # Filter to history window
+    cutoff_date = pd.Timestamp.utcnow() - pd.Timedelta(days=HISTORY_DAYS)
     df = df[df[date_col] >= cutoff_date].copy()
-    
+
     if df.empty:
+        print("[QEPC Opponent Processor] WARNING: No games within history window.")
         return df
-        
-    # 2. Calculate Days Ago
-    current_time = pd.Timestamp.now(tz='UTC')
-    df['DaysAgo'] = (current_time - df[date_col]).dt.days
-    
-    # 3. Calculate Weight: e^(-lambda * days_ago)
-    df['Weight'] = np.exp(-DECAY_LAMBDA * df['DaysAgo'])
-    
+
+    # Time difference in days
+    df["DaysAgo"] = (pd.Timestamp.utcnow() - df[date_col]).dt.days
+
+    # Exponential decay: weight = 0.5 ** (DaysAgo / HALF_LIFE_DAYS)
+    df["Weight"] = 0.5 ** (df["DaysAgo"] / HALF_LIFE_DAYS)
+
     return df
 
+
+# ---------------------------------------------------------------------------
+# Core Opponent (Defensive) Metrics Processor
+# ---------------------------------------------------------------------------
 def load_and_process_opponent_data() -> pd.DataFrame:
     """
-    Loads raw team statistics, applies time decay, and calculates Weighted DRtg.
+    Load raw team game stats and compute Weighted Defensive Rating (DRtg) 
+    from the opponent perspective.
+    
+    Returns a DataFrame with:
+        Team, DRtg
     """
     print("[QEPC Opponent Processor] Loading raw team data for Weighted DRtg...") 
 
+    # NOTE: data/raw/Team_Stats.csv is your canonical game-level team stats file
     raw_path = paths.get_data_dir() / "raw" / RAW_TEAM_STATS_FILE
     
     if not raw_path.exists():
@@ -76,26 +97,33 @@ def load_and_process_opponent_data() -> pd.DataFrame:
         if df.empty:
             print("[QEPC Opponent Processor] WARNING: No data found within history window.")
             return pd.DataFrame()
-
-        # 3. Calculate Team Possessions (Per Game)
-        df['TeamPossessions'] = df['FGA'] - df['OR'] + df['TO'] + (FTA_MULTIPLIER * df['FTA'])
         
-        # 4. Create Opponent View (Flipping perspective)
-        # We want to know what the Opponent (Team) ALLOWED.
-        # 'Team' below is the Opponent Name in the original row.
-        opponent_view = pd.DataFrame({
-            'Team': df['OpponentName'],
-            'PointsAllowed': df['PointsScored'],  
-            'PossessionsAllowed': df['TeamPossessions'],
-            'Weight': df['Weight'] # Carry over the recency weight
-        })
+        # 3. Possessions and Opponent Perspective
+        #    Standard NBA possessions formula (approx.)
+        df['Possessions'] = (
+            df['FGA']
+            + FTA_MULTIPLIER * df['FTA']
+            - df['OR']
+            + df['TO']
+        )
         
-        # 5. Calculate Weighted Averages
-        # Weighted Avg = Sum(Value * Weight) / Sum(Weight)
+        # Filter any non-sensical values
+        df = df[(df['Possessions'] > 0) & (df['PointsAllowed'] >= 0)].copy()
+        if df.empty:
+            print("[QEPC Opponent Processor] WARNING: No valid rows after possessions filter.")
+            return pd.DataFrame()
         
+        # Build opponent perspective: i.e. what each Team allowed to Opponent
+        # Here, we treat "TeamName" as the defensive team, so PointsAllowed
+        # and Possessions become the basis of DRtg.
+        opponent_view = df.copy()
+        opponent_view['Team'] = opponent_view['TeamName']  # rename key
+        
+        # Weighted points and possessions allowed
         opponent_view['Wt_PointsAllowed'] = opponent_view['PointsAllowed'] * opponent_view['Weight']
-        opponent_view['Wt_PossessionsAllowed'] = opponent_view['PossessionsAllowed'] * opponent_view['Weight']
+        opponent_view['Wt_PossessionsAllowed'] = opponent_view['Possessions'] * opponent_view['Weight']
         
+        # 4. Aggregate to team-level metrics
         df_metrics = opponent_view.groupby('Team').agg(
             Sum_Wt_Points=('Wt_PointsAllowed', 'sum'),
             Sum_Wt_Possessions=('Wt_PossessionsAllowed', 'sum'),
@@ -104,13 +132,15 @@ def load_and_process_opponent_data() -> pd.DataFrame:
         ).reset_index()
 
         # Filter small samples
-        df_metrics = df_metrics[df_metrics['GamesPlayed'] >= 5].copy()
-
-        # 6. Calculate Final Weighted DRtg
-        # Normalized per 100 possessions
-        # Formula: (SumWeightedPoints / SumWeights) / (SumWeightedPoss / SumWeights) * 100
-        # Simplifies to: SumWeightedPoints / SumWeightedPoss * 100
-        df_metrics['DRtg'] = (df_metrics['Sum_Wt_Points'] / df_metrics['Sum_Wt_Possessions']) * 100
+        df_metrics = df_metrics[df_metrics['GamesPlayed'] >= MIN_GAMES_PER_TEAM].copy()
+        if df_metrics.empty:
+            print("[QEPC Opponent Processor] WARNING: No teams met MIN_GAMES_PER_TEAM requirement.")
+            return pd.DataFrame()
+        
+        # 5. Compute Defensive Rating (points allowed per 100 possessions)
+        df_metrics['DRtg'] = (
+            df_metrics['Sum_Wt_Points'] / df_metrics['Sum_Wt_Possessions']
+        ) * 100
         
         # Standardize Names
         df_metrics['Team'] = df_metrics['Team'].apply(standardize_team_name)
