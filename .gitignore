@@ -2,6 +2,8 @@
 
 # 1. Massive Data Files (Too big for GitHub)
 data/backups/
+# Large raw stat dumps - keep these local only
+data/raw/
 
 # 2. System/Cache Files
 __pycache__/
@@ -11,3 +13,4 @@ __pycache__/
 *.swp
 *.save
 *.save.*
+
