@@ -108,7 +108,7 @@ def calculate_advanced_strengths() -> pd.DataFrame:
             Volatility  - synthetic variance factor (8–14 range)
     """
     project_root = _get_project_root()
-    team_stats_path = project_root / "data" / "Team_Stats.csv"
+    team_stats_path = project_root / "data" / "raw" / "Team_Stats.csv"
 
     if not team_stats_path.exists():
         raise FileNotFoundError(
