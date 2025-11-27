@@ -12,8 +12,6 @@
 
  **quantum-inspired probabilistic forecasting engine** for sports that goes beyond traditional Poisson models.
 
-### The Quantum-Inspired Vision 🌌
-
 Unlike conventional sports prediction models, QEPC draws inspiration from quantum computing principles:
 
 **🔮 Entangled State Modeling**  
@@ -553,3 +551,4 @@ If you find this project useful, please consider giving it a star! ⭐
 ---
 
 **Built with ❤️ and Python**
+
