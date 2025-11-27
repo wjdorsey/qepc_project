@@ -1,118 +1,227 @@
 """
-QEPC Module: strengths_v2.py
-Calculates robust, time-decayed team strength ratings (ORtg/DRtg/Pace/Volatility).
-Now supports Silent Mode for backtesting.
+QEPC NBA Team Strengths v2
+
+This module builds a 30-team table of offensive and defensive strengths,
+plus pace and a synthetic 'volatility' metric.
+
+It supports two kinds of Team_Stats.csv:
+
+1) Summary-style file with:
+   - 'Team' column
+   - ORtg/DRtg columns like 'ORtg', 'OffRtg', 'DRtg', 'DefRtg', etc.
+   - optional 'Pace' column
+
+2) Game-level file (your current setup) with columns like:
+   - 'teamCity', 'teamName'
+   - 'teamScore', 'opponentScore'
+   - one row per game per team
+
+In case (2), we:
+   - build 'Team' = teamCity + " " + teamName
+   - compute per-team offense = average teamScore
+   - compute per-team defense = average opponentScore
+   - use total points per game as a proxy for Pace
 """
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+from typing import Tuple
+
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from typing import Optional
-from qepc.sports.nba.player_data import load_raw_player_data
-from qepc.sports.nba.opponent_data import load_and_process_opponent_data 
-from qepc.utils.data_cleaning import standardize_team_name 
 
-# --- Configuration ---
-FTA_MULTIPLIER = 0.44 
-MIN_GAMES_PLAYED = 5 
-DAYS_HISTORY_WINDOW = 730 
-DECAY_LAMBDA = 0.002 
-RATING_FLOOR = 92.0
-RATING_CEILING = 122.0
 
-def calculate_advanced_strengths(cutoff_date: Optional[str] = None, verbose: bool = True) -> pd.DataFrame:
-    if verbose:
-        print(f"[QEPC Strength V2] Starting Advanced Calculation (Cutoff: {cutoff_date if cutoff_date else 'Now'})...") 
+# -----------------------------------------------------------------------------
+# Helpers to locate project_root and load team stats safely
+# -----------------------------------------------------------------------------
 
+def _get_project_root() -> Path:
+    """
+    Try to get the QEPC project root in a robust way.
+
+    1) If qepc.autoload.paths.get_project_root exists, use that.
+    2) Otherwise, walk upwards from this file looking for data/Team_Stats.csv.
+    3) Fallback to current working directory.
+    """
     try:
-        # Load data WITHOUT printing success messages (we rely on verbose flag in loader if needed)
-        # Ideally, we would silence player_data too, but let's just silence this function first.
-        raw_df = load_raw_player_data(file_name="PlayerStatistics.csv")
-    except Exception as e:
-        if verbose: print(f"[QEPC Strength V2] ERROR loading player data: {e}")
-        return pd.DataFrame()
-    
-    if raw_df.empty:
-        return pd.DataFrame()
+        from qepc.autoload.paths import get_project_root  # type: ignore
+        root = get_project_root()
+        if isinstance(root, Path):
+            return root
+        return Path(root)
+    except Exception:
+        pass
 
-    raw_df['Team'] = raw_df['Team'].apply(standardize_team_name)
-    raw_df['gameDate'] = pd.to_datetime(raw_df['gameDate'], utc=True, errors='coerce')
+    here = Path(__file__).resolve()
+    for parent in [here.parent] + list(here.parents):
+        candidate = parent / "data" / "Team_Stats.csv"
+        if candidate.exists():
+            return parent
 
-    # --- TIME TRAVEL LOGIC ---
-    if cutoff_date:
-        target_dt = pd.to_datetime(cutoff_date, utc=True)
-        raw_df = raw_df[raw_df['gameDate'] < target_dt].copy()
-        
-        if raw_df.empty:
-            if verbose: print(f"[QEPC Strength V2] Error: No data available before {cutoff_date}.")
-            return pd.DataFrame()
-            
-        current_time = target_dt
-    else:
-        current_time = pd.Timestamp.now(tz='UTC')
-
-    # ... (Standard Logic - Remains the same) ...
-    
-    window_start = current_time - timedelta(days=DAYS_HISTORY_WINDOW)
-    raw_df = raw_df[raw_df['gameDate'] >= window_start].copy()
-
-    # 3. Aggregate Players -> Team-Game Level
-    game_stats = raw_df.groupby(['Team', 'gameId', 'gameDate']).agg(
-        G_Points=('PTS', 'sum'),
-        G_FGA=('FGA', 'sum'),
-        G_OR=('REB', 'sum'), 
-        G_TO=('TOV', 'sum'),
-        G_FTA=('FTA', 'sum'),
-    ).reset_index()
-
-    # 4. Calculate Per-Game Stats
-    game_stats['G_Poss'] = (
-        game_stats['G_FGA'] - game_stats['G_OR'] + game_stats['G_TO'] + (FTA_MULTIPLIER * game_stats['G_FTA'])
+    warnings.warn(
+        "Could not automatically detect QEPC project root. "
+        "Falling back to current working directory."
     )
-    game_stats['G_Poss'] = game_stats['G_Poss'].replace(0, np.nan)
-    
-    # 5. Apply Time Decay
-    game_stats['DaysAgo'] = (current_time - game_stats['gameDate']).dt.days
-    game_stats['Weight'] = np.exp(-DECAY_LAMBDA * game_stats['DaysAgo'])
+    return Path.cwd()
 
-    # 6. Calculate Weighted Averages
-    game_stats['Wt_Points'] = game_stats['G_Points'] * game_stats['Weight']
-    game_stats['Wt_Poss'] = game_stats['G_Poss'] * game_stats['Weight']
 
-    team_stats = game_stats.groupby('Team').agg(
-        Sum_Wt_Points=('Wt_Points', 'sum'),
-        Sum_Wt_Poss=('Wt_Poss', 'sum'),
-        GamesPlayed=('gameId', 'count'),
-        Volatility=('G_Points', 'std') 
-    ).reset_index()
+def _detect_rating_columns(df: pd.DataFrame) -> Tuple[str | None, str | None]:
+    """
+    Detect offensive and defensive rating columns in Team_Stats.csv.
 
-    # Reduce min games for backtesting early season
-    min_games = MIN_GAMES_PLAYED if not cutoff_date else 1 
-    team_stats = team_stats[team_stats['GamesPlayed'] >= min_games].copy()
-    
-    avg_vol = team_stats['Volatility'].mean()
-    team_stats['Volatility'] = team_stats['Volatility'].fillna(avg_vol)
+    Returns (off_col, def_col), each can be None if not found.
+    """
+    off_candidates = ["ORtg", "OffRtg", "Off_Rtg", "OffensiveRating", "Offensive_Rating"]
+    def_candidates = ["DRtg", "DefRtg", "Def_Rtg", "DefensiveRating", "Defensive_Rating"]
 
-    # 7. Final Ratings
-    team_stats['ORtg'] = (team_stats['Sum_Wt_Points'] / team_stats['Sum_Wt_Poss']) * 100
-    simple_pace = game_stats.groupby('Team')['G_Poss'].mean().reset_index()
-    team_stats = pd.merge(team_stats, simple_pace, on='Team')
-    team_stats.rename(columns={'G_Poss': 'Pace'}, inplace=True)
-    
-    df_ortg = team_stats[['Team', 'ORtg', 'Pace', 'Volatility']].copy()
+    off_col = next((c for c in off_candidates if c in df.columns), None)
+    def_col = next((c for c in def_candidates if c in df.columns), None)
 
-    # --- PART 2: MERGE WITH DEFENSE ---
-    df_drtg = load_and_process_opponent_data()
+    return off_col, def_col
 
-    if df_drtg.empty:
-        LA_ORtg = df_ortg['ORtg'].mean()
-        df_ortg['DRtg'] = LA_ORtg
-        return df_ortg[['Team', 'ORtg', 'DRtg', 'Pace', 'Volatility']]
 
-    final_strengths = pd.merge(df_ortg, df_drtg, on='Team', how='inner')
-    
-    final_strengths['ORtg'] = final_strengths['ORtg'].clip(lower=RATING_FLOOR, upper=RATING_CEILING)
-    final_strengths['DRtg'] = final_strengths['DRtg'].clip(lower=RATING_FLOOR, upper=RATING_CEILING)
-    
-    if verbose:
-        print(f"[QEPC Strength V2] Calculated Time-Travel Strengths for {len(final_strengths)} teams.")
-    return final_strengths[['Team', 'ORtg', 'DRtg', 'Pace', 'Volatility']]
+def _detect_pace_column(df: pd.DataFrame) -> str | None:
+    """Return the pace column name if it exists, else None."""
+    for cand in ["Pace", "pace", "PossessionsPerGame"]:
+        if cand in df.columns:
+            return cand
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Main public function
+# -----------------------------------------------------------------------------
+
+def calculate_advanced_strengths() -> pd.DataFrame:
+    """
+    Build the advanced team strengths table from data/Team_Stats.csv.
+
+    Returns
+    -------
+    strengths : DataFrame
+        Columns:
+            Team        - team name
+            ORtg        - offensive strength (higher = better offense)
+            DRtg        - defensive strength (lower = better defense)
+            Pace        - pace proxy
+            Volatility  - synthetic variance factor (8–14 range)
+    """
+    project_root = _get_project_root()
+    team_stats_path = project_root / "data" / "Team_Stats.csv"
+
+    if not team_stats_path.exists():
+        raise FileNotFoundError(
+            f"Team_Stats.csv not found at {team_stats_path}. "
+            "Make sure this file exists in your data/ folder."
+        )
+
+    team_stats = pd.read_csv(team_stats_path)
+    cols = set(team_stats.columns)
+
+    # -------------------------------------------------------------------------
+    # CASE 1: Summary-style with 'Team' column already present
+    # -------------------------------------------------------------------------
+    if "Team" in cols:
+        off_col, def_col = _detect_rating_columns(team_stats)
+        pace_col = _detect_pace_column(team_stats)
+
+        if off_col is None or def_col is None:
+            raise ValueError(
+                "Team_Stats.csv has a 'Team' column but no ORtg/DRtg-like columns.\n"
+                f"Columns available: {list(team_stats.columns)}"
+            )
+
+        team_stats["Team"] = team_stats["Team"].astype(str).str.strip()
+
+        strengths = pd.DataFrame()
+        strengths["Team"] = team_stats["Team"]
+
+        strengths["ORtg"] = pd.to_numeric(team_stats[off_col], errors="coerce")
+        strengths["DRtg"] = pd.to_numeric(team_stats[def_col], errors="coerce")
+
+        or_mean = strengths["ORtg"].mean()
+        dr_mean = strengths["DRtg"].mean()
+        strengths["ORtg"] = strengths["ORtg"].fillna(or_mean)
+        strengths["DRtg"] = strengths["DRtg"].fillna(dr_mean)
+
+        if pace_col is not None:
+            strengths["Pace"] = pd.to_numeric(team_stats[pace_col], errors="coerce")
+            pace_mean = strengths["Pace"].mean()
+            strengths["Pace"] = strengths["Pace"].fillna(pace_mean)
+        else:
+            warnings.warn(
+                "No pace column found in Team_Stats.csv; using a flat league-average pace."
+            )
+            strengths["Pace"] = 98.0
+
+    # -------------------------------------------------------------------------
+    # CASE 2: Game-level file (your current format) with teamCity/teamName
+    # -------------------------------------------------------------------------
+    elif {"teamCity", "teamName", "teamScore", "opponentScore"}.issubset(cols):
+        # Build a Team label like "Boston Celtics"
+        team_stats["teamCity"] = team_stats["teamCity"].astype(str).str.strip()
+        team_stats["teamName"] = team_stats["teamName"].astype(str).str.strip()
+        team_stats["Team"] = team_stats["teamCity"] + " " + team_stats["teamName"]
+
+        # Convert scores to numeric
+        team_stats["teamScore"] = pd.to_numeric(team_stats["teamScore"], errors="coerce")
+        team_stats["opponentScore"] = pd.to_numeric(
+            team_stats["opponentScore"], errors="coerce"
+        )
+
+        # Aggregate by Team across all games in the file
+        agg = (
+            team_stats
+            .groupby("Team")
+            .agg(
+                ORtg=("teamScore", "mean"),          # offensive proxy = avg points scored
+                DRtg=("opponentScore", "mean"),      # defensive proxy = avg points allowed
+                Pace=("teamScore", "mean"),          # simple proxy; could use teamScore+oppScore
+            )
+            .reset_index()
+        )
+
+        strengths = agg.copy()
+
+    else:
+        raise ValueError(
+            "Team_Stats.csv is in an unrecognized format.\n"
+            "Supported formats:\n"
+            "  1) Has 'Team' + ORtg/DRtg columns\n"
+            "  2) Game-level with columns: 'teamCity', 'teamName', "
+            "'teamScore', 'opponentScore'\n"
+            f"Columns found: {list(team_stats.columns)}"
+        )
+
+    # -------------------------------------------------------------------------
+    # Volatility: synthetic but data-driven
+    # -------------------------------------------------------------------------
+    strengths["Team"] = strengths["Team"].astype(str).str.strip()
+
+    or_mean = strengths["ORtg"].mean()
+    dr_mean = strengths["DRtg"].mean()
+
+    diff_off = strengths["ORtg"] - or_mean
+    diff_def = strengths["DRtg"] - dr_mean
+    dist = (diff_off**2 + diff_def**2) ** 0.5
+
+    if dist.max() == dist.min():
+        strengths["Volatility"] = 10.0
+    else:
+        dist_min, dist_max = dist.min(), dist.max()
+        strengths["Volatility"] = 8.0 + (dist - dist_min) / (dist_max - dist_min) * 6.0
+
+    strengths = strengths.sort_values("Team").reset_index(drop=True)
+
+    print("Built advanced team strengths from Team_Stats.csv")
+    print(f"  Teams: {len(strengths)}")
+    print(f"  ORtg range: {strengths['ORtg'].min():.1f} – {strengths['ORtg'].max():.1f}")
+    print(f"  DRtg range: {strengths['DRtg'].min():.1f} – {strengths['DRtg'].max():.1f}")
+    print(f"  Pace range: {strengths['Pace'].min():.1f} – {strengths['Pace'].max():.1f}")
+    print(
+        f"  Volatility range: {strengths['Volatility'].min():.2f} – "
+        f"{strengths['Volatility'].max():.2f}"
+    )
+
+    return strengths
