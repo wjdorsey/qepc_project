@@ -1,7 +1,6 @@
 # QEPC Git Ignore File
 
 # 1. Massive Data Files (Too big for GitHub)
-data/raw/
 data/backups/
 
 # 2. System/Cache Files
