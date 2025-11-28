@@ -12,12 +12,12 @@ Key features
 
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 from typing import Tuple, Optional
 
-import numpy as pd
+import pandas as pd
 import numpy as np
+import warnings
 
 
 # =============================================================================
@@ -114,7 +114,7 @@ def _weighted_mean(values: pd.Series, weights: pd.Series) -> float:
     valid_mask = values.notna() & weights.notna() & (weights > 0)
     if not valid_mask.any():
         return np.nan
-    return np.average(values[valid_mask], weights=weights[valid_mask])
+    return float(np.average(values[valid_mask], weights=weights[valid_mask]))
 
 
 def _weighted_std(values: pd.Series, weights: pd.Series) -> float:
@@ -128,7 +128,7 @@ def _weighted_std(values: pd.Series, weights: pd.Series) -> float:
 
     weighted_mean = np.average(v, weights=w)
     weighted_var = np.average((v - weighted_mean) ** 2, weights=w)
-    return np.sqrt(weighted_var)
+    return float(np.sqrt(weighted_var))
 
 
 # =============================================================================
