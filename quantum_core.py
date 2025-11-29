@@ -329,3 +329,67 @@ if __name__ == "__main__":
     
     print()
     print("✅ All tests passed!")
+
+    """
+QEPC Module: qml_predictor.py
+=============================
+Quantum Machine Learning predictor using PennyLane.
+Encodes strength differentials into qubit rotations for win probabilities,
+mimicking quantum superposition of game states.
+"""
+
+import pennylane as qml
+from pennylane import numpy as np  # PennyLane's NumPy for autodiff
+from pennylane.optimize import GradientDescentOptimizer
+
+# Quantum device: Simulate on CPU (wires=1 for single-qubit simplicity)
+dev = qml.device("default.qubit", wires=1)
+
+@qml.qnode(dev)
+def quantum_circuit(strength_diff, params):
+    """
+    Single-qubit variational circuit.
+    - Superposition: Initial rotation encodes differential (like ELO or lambda diff).
+    - Entanglement-like: Learnable layers interfere for nonlinear mapping.
+    - Measurement: X-basis for asymmetric probs (positive/negative diffs differ).
+    """
+    # Encode feature as RY rotation (superposition of |0> and |1>)
+    angle = np.arctan(strength_diff)  # Normalize diff to [-pi/2, pi/2] for stability
+    qml.RY(angle, wires=0)
+    
+    # Variational layers: Add depth for expressivity (quantum inspiration)
+    qml.RX(params[0], wires=0)
+    qml.RY(params[1], wires=0)
+    
+    # Measure expectation in X-basis (PauliX): Yields prob in [-1,1], map to [0,1]
+    return qml.expval(qml.PauliX(wires=0))
+
+def qml_win_prob(strength_diff, trained_params):
+    """Predict home win prob from differential (e.g., lambda_home - lambda_away)."""
+    raw_prob = quantum_circuit(strength_diff, trained_params)
+    return (raw_prob + 1) / 2  # Map [-1,1] to [0,1]
+
+def train_qml_classifier(X_train, y_train, epochs=100, learning_rate=0.1):
+    """
+    Train on historical data.
+    - X_train: List of strength diffs (e.g., [home_lambda - away_lambda]).
+    - y_train: Binary labels (1=home win, 0=loss).
+    Returns trained params.
+    """
+    params = np.random.randn(2)  # Init for two variational params
+    opt = GradientDescentOptimizer(stepsize=learning_rate)
+    
+    def cost(params):
+        preds = [qml_win_prob(x, params) for x in X_train]
+        return np.mean((np.array(preds) - y_train) ** 2)  # MSE loss
+    
+    for epoch in range(epochs):
+        params = opt.step(cost, params)
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}: Loss = {cost(params):.4f}")
+    
+    return params
+
+# Example usage in QEPC:
+# trained_params = train_qml_classifier(historical_diffs, historical_outcomes)
+# For a game: win_prob = qml_win_prob(lambda_home - lambda_away, trained_params)
