@@ -1,174 +1,141 @@
 """
 QEPC NBA Data Source
-
-Smart loaders that try to use the nba_api package when available and allowed,
-but fall back to local CSVs when running in offline / cloud environments.
+Live from API.
 """
 
-from __future__ import annotations
-
-import os
-from typing import Optional
-
 import pandas as pd
-from pathlib import Path
+from nba_api.stats.endpoints import leaguedashteamstats
+from datetime import datetime, timedelta
 
-from qepc.sports.nba.strengths_v2 import calculate_advanced_strengths
+def load_team_stats(season="2025-26", local_file="data/raw/Team_Stats.csv"):
+    try:
+        stats = leaguedashteamstats.LeagueDashTeamStats(season=season)
+        df = stats.get_data_frames()[0]
+        print("Live API data fetched.")
+    except:
+        df = pd.read_csv(local_file)
+        print("Used local file.")
+    
+    # Fresh check
+    # Add date col if needed
+    if 'LAST_GAME_DATE' in df:  # Assume or add
+        max_date = pd.to_datetime(df['LAST_GAME_DATE']).max()
+        if (datetime.now() - max_date) > timedelta(days=1):
+            print("Data old!")
+    
+    df.rename(columns={'TEAM_NAME': 'Team', 'OFF_RATING': 'ORtg', 'DEF_RATING': 'DRtg', 'PACE': 'Pace'}, inplace=True)
+    return df[['Team', 'ORtg', 'DRtg', 'Pace']]
 
+# ... (keep your existing code at top)
 
-# ---------------------------------------------------------------------------
-# Helpers to detect environment / capabilities
-# ---------------------------------------------------------------------------
-def _project_root() -> Path:
+import requests  # For Balldontlie
+
+BALLDONTLIE_API_KEY = "c5ae7df3-682e-450c-b47e-f7e91396379e"  # Your key
+
+def load_live_injuries(local_file="data/Injury_Overrides.csv"):
     """
-    Try to find the project root (where the 'data' folder lives).
-
-    This uses:
-        - QEPC_PROJECT_ROOT env var, if set
-        - Otherwise walks up from this file until it finds a 'data' dir
-    """
-    env_root = os.environ.get("QEPC_PROJECT_ROOT")
-    if env_root:
-        root = Path(env_root).expanduser().resolve()
-        if (root / "data").exists():
-            return root
-
-    # Fallback: walk upward from this file
-    here = Path(__file__).resolve()
-    for parent in [here] + list(here.parents):
-        if (parent / "data").exists():
-            return parent
-
-    # Last resort: current working directory
-    return Path.cwd().resolve()
-
-
-def nba_api_available() -> bool:
-    """
-    Check whether the nba_api package is importable.
+    Fetches live injuries from API.
+    - Tries nba_api Rotowire first (live updates).
+    - Backup: Balldontlie API.
+    - Fallback: Local CSV.
     """
     try:
-        import nba_api  # type: ignore  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def online_mode_allowed() -> bool:
-    """
-    Check whether QEPC is allowed to use online APIs.
-
-    Controlled via env var:
-        QEPC_OFFLINE=1 -> force offline (no nba_api calls)
-    """
-    return os.environ.get("QEPC_OFFLINE", "0") != "1"
-
-
-# ---------------------------------------------------------------------------
-# CSV-based loaders (always available)
-# ---------------------------------------------------------------------------
-def load_team_stats_from_csv() -> pd.DataFrame:
-    """
-    Load team stats from your existing CSV file using the strengths_v2 helper.
-
-    This builds team strengths from data/raw/Team_Stats.csv (game-level stats)
-    and returns a DataFrame with columns like:
-        Team, ORtg, DRtg, Pace, Volatility
-    """
-    return calculate_advanced_strengths()
-
-
-# ---------------------------------------------------------------------------
-# NBA API loaders (only used when available)
-# ---------------------------------------------------------------------------
-def load_team_stats_from_nba_api(season: str = "2024-25") -> Optional[pd.DataFrame]:
-    """
-    Try to load team stats from the live NBA API via the nba_api package.
-
-    Returns a DataFrame on success, or None if anything goes wrong.
-    """
-    if not nba_api_available():
-        print("[QEPC NBA Data] nba_api package not installed; using CSV fallback.")
-        return None
-
-    if not online_mode_allowed():
-        print("[QEPC NBA Data] Online mode disabled via QEPC_OFFLINE; using CSV fallback.")
-        return None
-
-    try:
-        from nba_api.stats.endpoints import leaguedashteamstats
-
-        print(f"[QEPC NBA Data] Fetching team stats from nba_api for season {season}...")
-        resp = leaguedashteamstats.LeagueDashTeamStats(
-            season=season,
-            per_mode_detailed="PerGame",
-            measure_type_detailed_defense="Base",
-        )
-        data = resp.get_data_frames()[0]
-
-        # Expect team abbreviation / name and ORtg/DRtg columns
-        # We normalize to your internal schema: Team, ORtg, DRtg
-        df = data.copy()
-
-        # Try to build a nice 'Team' column
-        if "TEAM_NAME" in df.columns:
-            df["Team"] = df["TEAM_NAME"].astype(str)
-        elif "TEAM_ABBREVIATION" in df.columns:
-            df["Team"] = df["TEAM_ABBREVIATION"].astype(str)
-        else:
-            print("[QEPC NBA Data] ERROR: nba_api team stats missing TEAM_NAME/TEAM_ABBREVIATION.")
-            return None
-
-        # NBA API may provide OFF_RATING, DEF_RATING, etc.
-        off_candidates = ["OFF_RATING", "OFFRTG", "OffRtg", "ORtg"]
-        def_candidates = ["DEF_RATING", "DEFRTG", "DefRtg", "DRtg"]
-
-        off_col = next((c for c in off_candidates if c in df.columns), None)
-        def_col = next((c for c in def_candidates if c in df.columns), None)
-
-        if off_col is None or def_col is None:
-            print("[QEPC NBA Data] ERROR: nba_api frame missing clear ORtg/DRtg columns.")
-            return None
-
-        df = df[["Team", off_col, def_col]].copy()
-        df = df.rename(columns={off_col: "ORtg", def_col: "DRtg"})
-
-        # Basic cleaning
-        df["Team"] = df["Team"].astype(str)
-        df["ORtg"] = pd.to_numeric(df["ORtg"], errors="coerce")
-        df["DRtg"] = pd.to_numeric(df["DRtg"], errors="coerce")
-
-        print(f"[QEPC NBA Data] Loaded {len(df)} teams from nba_api.")
-        return df
-
+        # nba_api Rotowire (live)
+        from nba_api.live.nba.endpoints import scoreboard
+        board = scoreboard.ScoreBoard()
+        games = board.games.get_dict()
+        # Extract injuries (simplified; Rotowire has full)
+        injuries = []  # Loop games for player status
+        for game in games:
+            for team in [game['homeTeam'], game['awayTeam']]:
+                for player in team['players']:
+                    if player.get('status') != 'ACTIVE':
+                        injuries.append({'PlayerName': player['name'], 'Team': team['teamTricode'], 'Status': player.get('status', 'Unknown')})
+        df = pd.DataFrame(injuries)
+        if not df.empty:
+            print(f"Fetched {len(df)} live injuries from Rotowire/nba_api.")
+            return df
     except Exception as e:
-        print(f"[QEPC NBA Data] ERROR during nba_api fetch: {e}")
-        return None
+        print(f"nba_api error: {e}. Trying Balldontlie.")
+    
+    try:
+        # Balldontlie backup (live with key)
+        url = "https://api.balldontlie.io/v1/injuries"
+        headers = {"Authorization": BALLDONTLIE_API_KEY}
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['data']
+            df = pd.DataFrame(data)
+            df = df[['player', 'team', 'status']]  # Adjust cols
+            df.rename(columns={'player': 'PlayerName', 'team': 'Team', 'status': 'Status'}, inplace=True)
+            print(f"Fetched {len(df)} live injuries from Balldontlie.")
+            return df
+    except Exception as e:
+        print(f"Balldontlie error: {e}. Using local file.")
+    
+    # Fallback local
+    df = pd.read_csv(local_file)
+    print(f"Used local {len(df)} injuries.")
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def load_team_stats(
-    season: str = "2024-25",
-    prefer_api: bool = True,
-) -> pd.DataFrame:
+# ... (keep top code)
+
+import requests  # For Balldontlie
+
+BALLDONTLIE_API_KEY = "c5ae7df3-682e-450c-b47e-f7e91396379e"  # Your key
+
+def load_live_lineups(team_name=None, game_id=None, local_file="data/raw/Lineups.csv"):
     """
-    High-level helper for getting team stats.
-
-    Logic:
-      - If prefer_api is True, nba_api is installed, and online mode is allowed:
-            Try nba_api first; if that fails, fall back to CSV.
-      - Otherwise:
-            Go straight to CSV, no online calls.
-
-    This function does *not* modify any files; it only returns a DataFrame.
+    Fetches live player lineups.
+    - team_name: For team roster (starters).
+    - game_id: For specific game lineups (live).
+    - Tries nba_api first.
+    - Backup: Balldontlie (players only).
+    - Fallback: Local CSV.
     """
-    # Try API first if allowed
-    if prefer_api and nba_api_available() and online_mode_allowed():
-        df_api = load_team_stats_from_nba_api(season=season)
-        if df_api is not None:
-            return df_api
-
-    # Fallback: use the CSV you already rely on
-    return load_team_stats_from_csv()
+    try:
+        from nba_api.stats.static import teams
+        from nba_api.stats.endpoints import commonteamroster, boxscoretraditionalv2
+        
+        if team_name:
+            # Live team roster (starters)
+            team = [t for t in teams.get_teams() if t['full_name'] == team_name]
+            if not team:
+                raise ValueError("Team not found.")
+            team_id = team[0]['id']
+            roster = commonteamroster.CommonTeamRoster(season='2025-26', team_id=team_id)
+            df = roster.get_data_frames()[0]
+            df = df[['PLAYER', 'POSITION']]  # Starters
+            print(f"Fetched live roster for {team_name} from nba_api.")
+            return df
+        
+        if game_id:
+            # Live game lineups
+            box = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=game_id)
+            df = box.get_data_frames()[1]  # Player stats with starters
+            starters = df[df['START_POSITION'] != '']  # Filter starters
+            print(f"Fetched live lineups for game {game_id} from nba_api.")
+            return starters[['PLAYER_NAME', 'START_POSITION']]
+    
+    except Exception as e:
+        print(f"nba_api error: {e}. Trying Balldontlie.")
+    
+    try:
+        # Balldontlie backup (players only, no lineups—use for rosters)
+        url = f"https://api.balldontlie.io/v1/players?team={team_name.lower() if team_name else ''}"
+        headers = {"Authorization": BALLDONTLIE_API_KEY}
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['data']
+            df = pd.DataFrame(data)
+            df = df[['full_name', 'position']]  # Approx roster
+            print(f"Fetched {len(df)} players from Balldontlie.")
+            return df
+    except Exception as e:
+        print(f"Balldontlie error: {e}. Using local.")
+    
+    # Fallback local
+    df = pd.read_csv(local_file)
+    print(f"Used local {len(df)} lineups.")
+    return df

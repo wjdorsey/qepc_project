@@ -1,0 +1,11 @@
+NBA API Historical Data Fetch
+Generated: 2025-11-29 02:30:10.018441
+
+Seasons Fetched: 2014-15, 2015-16, 2016-17, 2017-18, 2018-19, 2019-20, 2020-21, 2021-22, 2022-23, 2023-24
+Total Rows: 23,958
+Unique Games: 11,979
+Date Range: 2014-10-28 00:00:00 to 2024-04-14 00:00:00
+
+Files Created:
+  • NBA_API_Raw_Data.csv
+  • NBA_API_QEPC_Format.csv
