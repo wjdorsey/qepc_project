@@ -1,1 +1,0 @@
-pip install pennylane pennylane-lightning  # For fast simulation; add pennylane-qiskit for IBM if desired
