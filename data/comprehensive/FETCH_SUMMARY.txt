@@ -1,0 +1,12 @@
+NBA API Comprehensive Data Fetch Summary
+============================================================
+
+Date: 2025-11-29 22:54:51
+
+Datasets:
+  [OK] Player_Game_Logs_All_Seasons.csv - Player game logs (87.8 MB)
+  [SKIP] Team_Dashboard_Stats_All_Seasons.csv - Not created
+  [OK] League_Team_Stats_All_Seasons.csv - League stats (0.1 MB)
+  [SKIP] Advanced_Box_Scores_Sample.csv - Not created
+
+Total Size: 87.8 MB
