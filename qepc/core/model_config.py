@@ -93,6 +93,10 @@ TRAVEL_PENALTY_PER_1000MI = 0.008  # 0.8% penalty per 1000 miles
 # SIMULATION SETTINGS
 # =============================================================================
 
+# =============================================================================
+# SIMULATION SETTINGS
+# =============================================================================
+
 # Default Monte Carlo trials
 DEFAULT_NUM_TRIALS = 20000
 
@@ -105,6 +109,9 @@ SCORE_CORRELATION = 0.35
 # Minimum realistic score floor
 MIN_SCORE_FLOOR = 70  # No NBA team scores below 70
 
+# Global calibration factor for lambda scaling
+# Adjust if lambdas need overall boost/reduction (1.0 = no change)
+LAMBDA_TOTAL_SCALE = 1.0
 
 # =============================================================================
 # RECENCY WEIGHTING

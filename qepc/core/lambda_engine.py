@@ -40,8 +40,16 @@ CITY_DISTANCES = {
 def _get_team_hca(team: str) -> float:
     """
     Home-court advantage multiplier.
-
-    BASE_HCA is the global baseline, TEAM_HCA_BOOST allows per-team tweaks.
+    
+    Parameters
+    ----------
+    team : str
+        Team name (e.g., "Boston Celtics")
+    
+    Returns
+    -------
+    float
+        HCA multiplier (e.g., 1.045 for 4.5% advantage)
     """
     return BASE_HCA * TEAM_HCA_BOOST.get(team, 1.0)
 

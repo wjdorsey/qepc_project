@@ -19,11 +19,41 @@ def run_qepc_simulation(df: pd.DataFrame, num_trials: int = DEFAULT_NUM_TRIALS) 
     try:
         stats = leaguedashteamstats.LeagueDashTeamStats(season='2025-26')
         team_stats = stats.get_data_frames()[0]
-        # Merge real vol (std of PTS)
-        df = pd.merge(df, team_stats[['TEAM_NAME', 'PTS_STD']], left_on='Home Team', right_on='TEAM_NAME', how='left')
-        df['vol_home'] = df['PTS_STD'].fillna(10.0)
-        # Repeat for away
-    except:
+        
+        # Check if PTS_STD column exists
+        if 'PTS_STD' not in team_stats.columns:
+            print("⚠️  Warning: PTS_STD column not in API response, using defaults")
+            df['vol_home'] = 10.0
+            df['vol_away'] = 10.0
+        else:
+            # Merge home team volatility
+            df = pd.merge(df, team_stats[['TEAM_NAME', 'PTS_STD']], 
+                          left_on='Home Team', right_on='TEAM_NAME', how='left')
+            df['vol_home'] = df['PTS_STD'].fillna(10.0)
+            df = df.drop(['PTS_STD', 'TEAM_NAME'], axis=1)
+            
+            # Merge away team volatility
+            df = pd.merge(df, team_stats[['TEAM_NAME', 'PTS_STD']], 
+                          left_on='Away Team', right_on='TEAM_NAME', how='left')
+            df['vol_away'] = df['PTS_STD'].fillna(10.0)
+            df = df.drop(['PTS_STD', 'TEAM_NAME'], axis=1)
+        
+    except Exception as e:
+        print(f"⚠️  Could not fetch live volatility stats: {type(e).__name__}: {e}")
+        print("    Using default volatility values (10.0 for all teams)")
+        df['vol_home'] = 10.0
+        df['vol_away'] = 10.0
+    
+    # Continue with simulation...
+        
+        # Merge away team volatility
+        df = pd.merge(df, team_stats[['TEAM_NAME', 'PTS_STD']], 
+                      left_on='Away Team', right_on='TEAM_NAME', how='left')
+        df['vol_away'] = df['PTS_STD'].fillna(10.0)
+        df = df.drop(['PTS_STD', 'TEAM_NAME'], axis=1)
+        
+    except (ImportError, AttributeError, IndexError) as e:
+        print(f"⚠️  Could not fetch live volatility stats: {type(e).__name__}: {e}")
         df['vol_home'] = 10.0
         df['vol_away'] = 10.0
     

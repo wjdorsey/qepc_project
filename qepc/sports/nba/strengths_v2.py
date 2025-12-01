@@ -307,7 +307,8 @@ def calculate_advanced_strengths(
             print("❌ Cannot find a date column in game data.")
         return pd.DataFrame()
 
-    df["gameDate"] = pd.to_datetime(df[date_col], errors="coerce")
+    # Parse dates with utc=True to handle ISO 8601 format with timezone
+    df["gameDate"] = pd.to_datetime(df[date_col], utc=True, errors="coerce")
 
     # Drop truly invalid dates
     valid_dates = df["gameDate"].notna()
