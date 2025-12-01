@@ -1,6 +1,7 @@
 """
 QEPC Module: model_config.py
-Real 2024-25 NBA settings with expanded team-specific adjustments.
+Real NBA settings with expanded team-specific adjustments.
+(Current season determined dynamically, e.g. 2025-26.)
 """
 
 from datetime import datetime
@@ -9,7 +10,7 @@ from datetime import datetime
 # LEAGUE SETTINGS
 # =============================================================================
 
-LEAGUE_AVG_POINTS = 115.0  # 2024-25 NBA scoring average
+LEAGUE_AVG_POINTS = 115.0  # modern scoring average
 
 def get_current_season() -> str:
     """Dynamically determine current NBA season."""

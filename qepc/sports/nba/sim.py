@@ -16,6 +16,8 @@ from typing import Optional
 import pandas as pd
 
 from qepc.autoload.paths import get_games_path
+from qepc.sports.nba.data_sources import get_today_schedule
+
 
 try:  # nba_api may not be installed in every environment
     from nba_api.stats.endpoints import leaguegamelog, scoreboard
@@ -248,53 +250,143 @@ def _load_today_from_scoreboard() -> Optional[pd.DataFrame]:
     except Exception as exc:
         print(f"[QEPC sim] ScoreBoard API failed, will fall back to LeagueGameLog/CSV: {exc}")
         return None
+def _load_today_from_live_csv() -> Optional[pd.DataFrame]:
+    """
+    Try to load today's games from a pre-built NBA API snapshot:
+        data/live/games_today_nba_api.csv
 
+    Expected columns (from your live notebook):
+        - GAME_DATE_EST (or similar date column)
+        - HOME_TEAM_QEPC
+        - AWAY_TEAM_QEPC
+        - possibly HOME_PTS, AWAY_PTS, GAME_ID, etc.
+
+    Returns a DataFrame with:
+        - gameDate (datetime)
+        - Home Team (QEPC name)
+        - Away Team (QEPC name)
+        - gameId (if available; otherwise NaN)
+    """
+    try:
+        games_path = get_games_path()              # e.g. data/Games.csv
+        live_path = games_path.parent / "live" / "games_today_nba_api.csv"
+    except Exception as exc:
+        print(f"[QEPC sim] Could not resolve live schedule path: {exc}")
+        return None
+
+    if not live_path.exists():
+        return None
+
+    try:
+        df = pd.read_csv(live_path)
+    except Exception as exc:
+        print(f"[QEPC sim] Failed to read {live_path}: {exc}")
+        return None
+
+    if df.empty:
+        return None
+
+    # ---- Find a date column ----
+    date_col = None
+    for cand in ["gameDate", "GAME_DATE_EST", "GAME_DATE", "GAME_DATE_LIVE"]:
+        if cand in df.columns:
+            date_col = cand
+            break
+
+    if date_col is None:
+        for c in df.columns:
+            if "date" in str(c).lower():
+                date_col = c
+                break
+
+    if date_col is None:
+        print("[QEPC sim] Live CSV has no recognizable date column; ignoring.")
+        return None
+
+    df = df.copy()
+    df["gameDate"] = pd.to_datetime(df[date_col], errors="coerce")
+
+    if df["gameDate"].isna().all():
+        print("[QEPC sim] Live CSV gameDate all NaT; ignoring.")
+        return None
+
+    today = date.today()
+    df_today = df[df["gameDate"].dt.date == today].copy()
+
+    if df_today.empty:
+        print(f"[QEPC sim] Live CSV has no rows for {today.isoformat()}.")
+        return None
+
+    # ---- Map team columns into QEPC canonical names ----
+    if "Home Team" not in df_today.columns:
+        if "HOME_TEAM_QEPC" in df_today.columns:
+            df_today["Home Team"] = df_today["HOME_TEAM_QEPC"]
+        elif "HOME_TEAM_NAME" in df_today.columns:
+            df_today["Home Team"] = df_today["HOME_TEAM_NAME"]
+
+    if "Away Team" not in df_today.columns:
+        if "AWAY_TEAM_QEPC" in df_today.columns:
+            df_today["Away Team"] = df_today["AWAY_TEAM_QEPC"]
+        elif "AWAY_TEAM_NAME" in df_today.columns:
+            df_today["Away Team"] = df_today["AWAY_TEAM_NAME"]
+
+    df_today = df_today[
+        df_today["Home Team"].notna() & df_today["Away Team"].notna()
+    ].copy()
+
+    if df_today.empty:
+        print("[QEPC sim] Live CSV rows missing Home/Away Team; ignoring.")
+        return None
+
+    # ---- Ensure gameId exists ----
+    if "gameId" not in df_today.columns:
+        if "GAME_ID" in df_today.columns:
+            df_today["gameId"] = df_today["GAME_ID"]
+        else:
+            df_today["gameId"] = pd.NA
+
+    print("[QEPC sim] Loaded today's schedule from games_today_nba_api.csv.")
+    return df_today[["gameDate", "Home Team", "Away Team", "gameId"]].copy()
 
 def get_today_games(with_lineups: bool = False) -> pd.DataFrame:
     """
-    Return a DataFrame of *today's* NBA games.
+    Return a DataFrame of today's NBA games.
 
     Priority:
-    1. ScoreBoard (live)
-    2. LeagueGameLog (season) via load_nba_schedule()
-    3. Local CSVs via _load_schedule_from_file()
+      1) data/live/games_today_nba_api.csv   (your notebook snapshot)
+      2) nba_api ScoreboardV2               (live)
+      3) ESPN scoreboard                    (live)
+      4) local data/Games.csv               (canonical schedule)
     """
+    from datetime import date
+
     today = date.today()
 
-    # 1) Try live scoreboard
-    today_df = _load_today_from_scoreboard()
+    # Use the unified data_sources helper
+    today_df = get_today_schedule(target_date=today, verbose=True)
 
-    # 2) Fallback to full schedule
-    if today_df is None:
-        full_schedule = load_nba_schedule()
-
-        if "gameDate" not in full_schedule.columns:
-            print("[QEPC sim] Schedule has no gameDate column; returning empty DataFrame.")
-            return pd.DataFrame()
-
-        full_schedule = full_schedule.copy()
-        full_schedule["gameDate"] = pd.to_datetime(
-            full_schedule["gameDate"], errors="coerce"
-        )
-
-        if full_schedule["gameDate"].isna().all():
-            print(
-                "[QEPC sim] gameDate column is not datetimelike or all NaT; "
-                "returning empty DataFrame."
-            )
-            return pd.DataFrame()
-
-        today_df = full_schedule[full_schedule["gameDate"].dt.date == today].copy()
-
-    if today_df.empty:
+    if today_df is None or today_df.empty:
         print(f"[QEPC sim] No games found for {today.isoformat()}.")
-        return today_df
+        return pd.DataFrame(columns=["gameDate", "Home Team", "Away Team", "gameId"])
 
+    # Ensure required columns exist
+    for col in ["gameDate", "Home Team", "Away Team"]:
+        if col not in today_df.columns:
+            print(f"[QEPC sim] '{col}' missing from today_df; returning empty DataFrame.")
+            return pd.DataFrame(columns=["gameDate", "Home Team", "Away Team", "gameId"])
+
+    if "gameId" not in today_df.columns:
+        today_df["gameId"] = pd.NA
+
+    # Optionally attach starting lineups (if your lineup module is wired)
     if with_lineups:
         try:
             from qepc.sports.nba.lineups import get_lineup
         except Exception as exc:
-            print(f"[QEPC sim] Could not import get_lineup; returning games without lineups: {exc}")
+            print(
+                "[QEPC sim] Could not import get_lineup; "
+                f"returning games without lineups: {exc}"
+            )
             return today_df
 
         if "Home Lineup" not in today_df.columns:
@@ -305,7 +397,7 @@ def get_today_games(with_lineups: bool = False) -> pd.DataFrame:
         for idx, row in today_df.iterrows():
             home_team = row.get("Home Team")
             away_team = row.get("Away Team")
-            game_id = row.get("gameId") if "gameId" in today_df.columns else None
+            game_id = row.get("gameId")
 
             home_lineup = get_lineup(home_team, game_id)
             away_lineup = get_lineup(away_team, game_id)

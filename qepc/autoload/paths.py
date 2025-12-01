@@ -19,6 +19,10 @@ def get_data_dir() -> Path:
     """Returns the absolute path to the data directory (project_root/data)."""
     return get_project_root() / "data"
 
+def get_raw_data_dir() -> Path:
+    """Returns the absolute path to the raw data directory (project_root/data/raw)."""
+    return get_data_dir() / "raw"
+
 def get_games_path() -> Path:
     """Returns the absolute path to the Games.csv file."""
     return get_data_dir() / "Games.csv"

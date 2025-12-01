@@ -31,6 +31,22 @@ REQUIRED_FILES: Dict[str, str] = {
     "Restore Guide (Markdown)": "notebooks/RESTORE_GUIDE.md",
 }
 
+# Some required files are *local-only* large CSVs that may not exist
+# in a lightweight GitHub clone. When these are missing, we treat the
+# status as WARN (not FAIL) and include guidance on how to generate them.
+LOCAL_OPTIONAL_FILES: Dict[str, str] = {
+    "Raw Player Stats": (
+        "Local-only large CSV missing. "
+        "Generate via Data Upgrades notebooks or place PlayerStatistics.csv "
+        "under data/raw/ if you want full offline backtesting."
+    ),
+    "Raw Team Stats": (
+        "Local-only large CSV missing. "
+        "Generate via Data Upgrades notebooks or place Team_Stats.csv "
+        "under data/raw/ if you want full offline backtesting."
+    ),
+}
+
 # Optional schema expectations. We only validate schema if the file exists.
 EXPECTED_SCHEMAS: Dict[str, List[str]] = {
     # Canonical schedule
@@ -64,13 +80,30 @@ def get_project_root() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# 2. Simple print helper
+# 2. Simple print + HTML helpers
 # ---------------------------------------------------------------------------
 
-def print_status(label: str, ok: bool, detail: str = "") -> None:
-    """Print a single status line with emoji and text."""
-    status = "OK" if ok else "FAIL"
-    emoji = "✅" if ok else "❌"
+def print_status(label: str, ok: bool, detail: str = "", status_override: str = None) -> None:
+    """Print a single status line with emoji and text.
+
+    ok:
+        - True  -> treated as OK
+        - False -> treated as FAIL, unless status_override is provided
+
+    status_override:
+        - If "WARN", we render a warning state (⚠️ WARN),
+          which is useful for local-only optional files.
+    """
+    if status_override is not None:
+        status = status_override
+        if status_override.upper() == "WARN":
+            emoji = "⚠️"
+        else:
+            emoji = "✅" if ok else "❌"
+    else:
+        status = "OK" if ok else "FAIL"
+        emoji = "✅" if ok else "❌"
+
     msg = f"{emoji} {label}: {status}"
     if detail:
         msg += f" – {detail}"
@@ -85,7 +118,7 @@ def _html_table(title: str, rows: List[Tuple[str, str, str]]) -> None:
     html_rows = "".join(
         f"<tr>"
         f"<td><b>{label}</b></td>"
-        f"<td style='color:{'#2e7d32' if status == 'OK' else '#c62828'}'>{status}</td>"
+        f"<td style='color:{('#2e7d32' if status == 'OK' else ('#f9a825' if status == 'WARN' else '#c62828'))}'>{status}</td>"
         f"<td>{detail}</td>"
         f"</tr>"
         for (label, status, detail) in rows
@@ -125,6 +158,16 @@ def check_required_files(root: Path) -> List[Tuple[str, str, str]]:
     for label, rel_path in REQUIRED_FILES.items():
         abs_path = root / rel_path
         exists = abs_path.exists()
+
+        # Local-only optional big files (e.g., raw stats) get WARN, not FAIL,
+        # when missing. This makes a fresh GitHub clone friendlier while still
+        # nudging the user toward generating them for full offline use.
+        if label in LOCAL_OPTIONAL_FILES and not exists:
+            detail = f"Missing at {abs_path}. {LOCAL_OPTIONAL_FILES[label]}"
+            print_status(label, False, detail, status_override="WARN")
+            results.append((label, "WARN", detail))
+            continue
+
         detail = f"{abs_path}" if exists else f"Missing at {abs_path}"
         print_status(label, exists, detail)
         results.append((label, "OK" if exists else "FAIL", detail))
@@ -218,13 +261,12 @@ def check_module_imports() -> List[Tuple[str, str, str]]:
 
 def run_system_check() -> Dict[str, Any]:
     """
-    Executes a full pre-flight check of the QEPC environment.
+    Run the full QEPC system check and return a summary dictionary.
+    Intended to be called from notebooks as:
 
-    Returns a dict with the raw results for optional programmatic use.
-    This function is what qepc_autoload expects to alias as run_diagnostics.
+        from qepc.utils.diagnostics import run_system_check
+        run_system_check()
     """
-    print("🚀 QEPC SYSTEM DIAGNOSTICS INITIALIZED...\n")
-
     root = get_project_root()
     print_status("Project Root", True, f"Resolved to {root}")
 
