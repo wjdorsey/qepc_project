@@ -5,7 +5,7 @@ The main prediction engine that combines:
 - Team strengths with recency weighting
 - Quantum state simulation
 - Situational adjustments (home court, rest, injuries)
-- Entanglement, interference, and tunneling effects
+- Vegas odds comparison (NEW!)
 """
 
 import pandas as pd
@@ -24,36 +24,59 @@ from qepc.sports.nba.strengths import StrengthCalculator, TeamStrength
 
 
 @dataclass
+class VegasComparison:
+    """Comparison between QEPC prediction and Vegas line."""
+    vegas_spread: Optional[float]
+    qepc_spread: float
+    spread_diff: Optional[float]  # Positive = QEPC likes home more than Vegas
+    
+    vegas_home_prob: Optional[float]
+    qepc_home_prob: float
+    prob_diff: Optional[float]  # Positive = QEPC more confident in home
+    
+    edge: Optional[str]  # "HOME", "AWAY", or None
+    edge_size: Optional[float]  # How big is the disagreement
+    
+    @property
+    def has_edge(self) -> bool:
+        return self.edge is not None and self.edge_size is not None and self.edge_size > 2.0
+
+
+@dataclass
 class GamePrediction:
     """Complete prediction for a single game."""
     
     # Teams
     home_team: str
     away_team: str
+    game_id: Optional[str] = None
     
     # Win probabilities
-    home_win_prob: float
-    away_win_prob: float
+    home_win_prob: float = 0.5
+    away_win_prob: float = 0.5
     
     # Score predictions
-    home_score: float
-    away_score: float
-    predicted_spread: float  # Home - Away (negative = away favored)
-    predicted_total: float
+    home_score: float = 110.0
+    away_score: float = 108.0
+    predicted_spread: float = 0.0  # Home - Away (negative = away favored)
+    predicted_total: float = 218.0
     
     # Uncertainty
-    spread_std: float
-    total_std: float
+    spread_std: float = 10.0
+    total_std: float = 12.0
     
     # Confidence (0-1, higher = more confident)
-    confidence: float
+    confidence: float = 0.5
     
     # Components (for analysis)
-    home_expected_raw: float  # Before adjustments
-    away_expected_raw: float
-    home_court_adjustment: float
-    rest_adjustment: float
-    injury_adjustment: float
+    home_expected_raw: float = 110.0
+    away_expected_raw: float = 108.0
+    home_court_adjustment: float = 0.0
+    rest_adjustment: float = 0.0
+    injury_adjustment: float = 0.0
+    
+    # Vegas comparison (NEW!)
+    vegas: Optional[VegasComparison] = None
     
     @property
     def predicted_winner(self) -> str:
@@ -63,9 +86,13 @@ class GamePrediction:
     def is_high_confidence(self) -> bool:
         return self.confidence > 0.65
     
+    @property
+    def has_vegas_edge(self) -> bool:
+        return self.vegas is not None and self.vegas.has_edge
+    
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
-        return {
+        result = {
             'Home_Team': self.home_team,
             'Away_Team': self.away_team,
             'Home_Win_Prob': round(self.home_win_prob, 3),
@@ -73,17 +100,27 @@ class GamePrediction:
             'Predicted_Winner': self.predicted_winner,
             'Home_Score': round(self.home_score, 1),
             'Away_Score': round(self.away_score, 1),
-            'Spread': round(self.predicted_spread, 1),
+            'QEPC_Spread': round(self.predicted_spread, 1),
             'Total': round(self.predicted_total, 1),
             'Confidence': round(self.confidence, 3),
         }
+        
+        # Add Vegas comparison if available
+        if self.vegas:
+            result['Vegas_Spread'] = self.vegas.vegas_spread
+            result['Spread_Diff'] = round(self.vegas.spread_diff, 1) if self.vegas.spread_diff else None
+            result['Edge'] = self.vegas.edge
+            result['Edge_Size'] = round(self.vegas.edge_size, 1) if self.vegas.edge_size else None
+        
+        return result
 
 
 class GamePredictor:
     """
     Main game prediction engine.
     
-    Combines team strengths, quantum simulation, and situational factors.
+    Combines team strengths, quantum simulation, situational factors,
+    and Vegas odds comparison.
     """
     
     def __init__(
@@ -107,12 +144,11 @@ class GamePredictor:
         self._strengths: Dict[str, TeamStrength] = {}
         self._injuries: pd.DataFrame = None
         self._rest_data: pd.DataFrame = None
+        self._vegas_odds: pd.DataFrame = None
     
     def prepare(self, cutoff_date: str = None, verbose: bool = True):
         """
         Prepare the predictor by loading all required data.
-        
-        Call this before making predictions.
         """
         if verbose:
             print("🔮 Preparing QEPC Predictor...")
@@ -130,8 +166,11 @@ class GamePredictor:
         
         # Load rest data
         self._rest_data = self.loader.load_schedule_with_rest()
-        if self._rest_data is not None and verbose:
-            print(f"😴 Loaded rest day data")
+        
+        # Load Vegas odds (NEW!)
+        self._vegas_odds = self.loader.load_vegas_odds()
+        if self._vegas_odds is not None and verbose:
+            print(f"💰 Loaded Vegas odds for {len(self._vegas_odds)} games")
         
         if verbose:
             print(f"✅ Ready to predict! ({len(self._strengths)} teams)")
@@ -140,26 +179,12 @@ class GamePredictor:
         self,
         home_team: str,
         away_team: str,
+        game_id: str = None,
         game_date: str = None,
         n_simulations: int = None
     ) -> Optional[GamePrediction]:
         """
         Predict a single game.
-        
-        Parameters
-        ----------
-        home_team : str
-            Home team name
-        away_team : str  
-            Away team name
-        game_date : str, optional
-            Date of game (for rest calculations)
-        n_simulations : int, optional
-            Number of Monte Carlo simulations
-            
-        Returns
-        -------
-        GamePrediction or None if teams not found
         """
         n_sims = n_simulations or self.config.simulation.default_simulations
         
@@ -174,10 +199,10 @@ class GamePredictor:
             print(f"⚠️  Team not found: {away_team}")
             return None
         
-        # Calculate expected scores (before adjustments)
+        # Calculate expected scores
         game_pace = (home_strength.pace + away_strength.pace) / 2
         
-        # Use interference to adjust for matchup
+        # Use interference for matchup effects
         home_matchup_mod = self.quantum_sim.interference.calculate_matchup_modifier(
             home_strength.ortg, 
             away_strength.drtg,
@@ -204,24 +229,20 @@ class GamePredictor:
         home_expected = home_expected_raw + home_court_adj + rest_adj + injury_adj_home
         away_expected = away_expected_raw + injury_adj_away
         
-        # Create quantum states based on volatility
+        # Create quantum states
         home_state = create_quantum_state_from_volatility(
-            home_strength.volatility / home_strength.ppg  # CV
+            home_strength.volatility / home_strength.ppg if home_strength.ppg > 0 else 0.1
         )
         away_state = create_quantum_state_from_volatility(
-            away_strength.volatility / away_strength.ppg
+            away_strength.volatility / away_strength.ppg if away_strength.ppg > 0 else 0.1
         )
         
-        # Adjust states for situation
+        # Adjust for situation
         home_state = adjust_state_for_situation(
-            home_state,
-            is_home=True,
-            momentum=home_strength.momentum
+            home_state, is_home=True, momentum=home_strength.momentum
         )
         away_state = adjust_state_for_situation(
-            away_state,
-            is_home=False,
-            momentum=away_strength.momentum
+            away_state, is_home=False, momentum=away_strength.momentum
         )
         
         # Run quantum simulation
@@ -244,9 +265,19 @@ class GamePredictor:
             away_strength=away_strength
         )
         
+        # Get Vegas comparison (NEW!)
+        vegas_comparison = self._compare_to_vegas(
+            game_id=game_id,
+            home_team=home_team,
+            away_team=away_team,
+            qepc_spread=sim_result['predicted_spread'],
+            qepc_home_prob=sim_result['home_win_prob']
+        )
+        
         return GamePrediction(
             home_team=home_team,
             away_team=away_team,
+            game_id=game_id,
             home_win_prob=sim_result['home_win_prob'],
             away_win_prob=sim_result['away_win_prob'],
             home_score=sim_result['home_score_mean'],
@@ -261,6 +292,62 @@ class GamePredictor:
             home_court_adjustment=home_court_adj,
             rest_adjustment=rest_adj,
             injury_adjustment=injury_adj_home - injury_adj_away,
+            vegas=vegas_comparison,
+        )
+    
+    def _compare_to_vegas(
+        self,
+        game_id: str,
+        home_team: str,
+        away_team: str,
+        qepc_spread: float,
+        qepc_home_prob: float
+    ) -> Optional[VegasComparison]:
+        """Compare QEPC prediction to Vegas line."""
+        if self._vegas_odds is None or self._vegas_odds.empty:
+            return None
+        
+        # Try to find by game_id first
+        vegas_line = None
+        if game_id:
+            match = self._vegas_odds[self._vegas_odds['game_id'] == game_id]
+            if not match.empty:
+                vegas_line = match.iloc[0]
+        
+        if vegas_line is None:
+            return None
+        
+        vegas_spread = vegas_line.get('vegas_spread_home')
+        vegas_home_prob = vegas_line.get('vegas_implied_home_prob')
+        
+        # Calculate differences
+        spread_diff = None
+        if vegas_spread is not None and not pd.isna(vegas_spread):
+            spread_diff = qepc_spread - vegas_spread  # Positive = QEPC likes home more
+        
+        prob_diff = None
+        if vegas_home_prob is not None and not pd.isna(vegas_home_prob):
+            prob_diff = qepc_home_prob - vegas_home_prob
+        
+        # Determine if there's an edge
+        edge = None
+        edge_size = None
+        if spread_diff is not None:
+            edge_size = abs(spread_diff)
+            if spread_diff > 2.0:  # QEPC likes home team more than Vegas
+                edge = "HOME"
+            elif spread_diff < -2.0:  # QEPC likes away team more than Vegas
+                edge = "AWAY"
+        
+        return VegasComparison(
+            vegas_spread=vegas_spread,
+            qepc_spread=qepc_spread,
+            spread_diff=spread_diff,
+            vegas_home_prob=vegas_home_prob,
+            qepc_home_prob=qepc_home_prob,
+            prob_diff=prob_diff,
+            edge=edge,
+            edge_size=edge_size,
         )
     
     def predict_games(
@@ -269,30 +356,26 @@ class GamePredictor:
         game_date: str = None,
         verbose: bool = True
     ) -> List[GamePrediction]:
-        """
-        Predict multiple games.
-        
-        Parameters
-        ----------
-        games : list of (home_team, away_team) tuples
-        game_date : str, optional
-        verbose : bool
-        
-        Returns
-        -------
-        List of GamePrediction objects
-        """
+        """Predict multiple games."""
         predictions = []
         
         for home, away in games:
-            pred = self.predict_game(home, away, game_date)
+            pred = self.predict_game(home, away, game_date=game_date)
             if pred is not None:
                 predictions.append(pred)
                 
                 if verbose:
                     winner = pred.predicted_winner
                     prob = max(pred.home_win_prob, pred.away_win_prob)
-                    print(f"🏀 {away} @ {home}: {winner} ({prob:.1%}) | Spread: {pred.predicted_spread:+.1f}")
+                    line = f"🏀 {away} @ {home}: {winner} ({prob:.1%}) | Spread: {pred.predicted_spread:+.1f}"
+                    
+                    # Add Vegas comparison
+                    if pred.vegas and pred.vegas.vegas_spread is not None:
+                        line += f" (Vegas: {pred.vegas.vegas_spread:+.1f})"
+                        if pred.has_vegas_edge:
+                            line += f" ⭐ EDGE: {pred.vegas.edge}"
+                    
+                    print(line)
         
         return predictions
     
@@ -305,74 +388,73 @@ class GamePredictor:
                 print("❌ No games found for today")
             return []
         
-        # Extract home/away teams
+        # Extract games
         games = []
+        game_ids = []
+        
         for _, row in today_games.iterrows():
-            home = row.get('Home Team', row.get('HOME_TEAM_NAME', None))
-            away = row.get('Away Team', row.get('AWAY_TEAM_NAME', None))
+            home = row.get('Home Team', row.get('home_team', None))
+            away = row.get('Away Team', row.get('away_team', None))
+            game_id = row.get('game_id', None)
+            
             if home and away:
                 games.append((home, away))
+                game_ids.append(game_id)
         
         if verbose:
             print(f"📅 Found {len(games)} games today")
         
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        return self.predict_games(games, game_date=today_str, verbose=verbose)
+        # Predict with game IDs for Vegas matching
+        predictions = []
+        for (home, away), game_id in zip(games, game_ids):
+            pred = self.predict_game(home, away, game_id=game_id)
+            if pred is not None:
+                predictions.append(pred)
+                
+                if verbose:
+                    winner = pred.predicted_winner
+                    prob = max(pred.home_win_prob, pred.away_win_prob)
+                    line = f"🏀 {away} @ {home}: {winner} ({prob:.1%}) | Spread: {pred.predicted_spread:+.1f}"
+                    
+                    if pred.vegas and pred.vegas.vegas_spread is not None:
+                        line += f" (Vegas: {pred.vegas.vegas_spread:+.1f})"
+                        if pred.has_vegas_edge:
+                            line += f" ⭐ EDGE"
+                    
+                    print(line)
+        
+        return predictions
     
-    def _calculate_rest_adjustment(
-        self,
-        home_team: str,
-        away_team: str,
-        game_date: str = None
-    ) -> float:
+    def find_edges(self, predictions: List[GamePrediction] = None) -> List[GamePrediction]:
+        """
+        Find games where QEPC disagrees with Vegas by 2+ points.
+        
+        These are potential value bets!
+        """
+        if predictions is None:
+            predictions = self.predict_today(verbose=False)
+        
+        edges = [p for p in predictions if p.has_vegas_edge]
+        
+        print(f"\n⭐ FOUND {len(edges)} POTENTIAL EDGES")
+        print("=" * 60)
+        
+        for pred in sorted(edges, key=lambda x: x.vegas.edge_size, reverse=True):
+            v = pred.vegas
+            print(f"\n{pred.away_team} @ {pred.home_team}")
+            print(f"   QEPC Spread: {pred.predicted_spread:+.1f}")
+            print(f"   Vegas Spread: {v.vegas_spread:+.1f}")
+            print(f"   Difference: {v.spread_diff:+.1f} pts")
+            print(f"   Edge: Bet {v.edge} ({v.edge_size:.1f} pts)")
+        
+        return edges
+    
+    def _calculate_rest_adjustment(self, home_team: str, away_team: str, game_date: str = None) -> float:
         """Calculate rest-based point adjustment."""
-        if self._rest_data is None or game_date is None:
-            return 0.0
-        
-        # Try to find rest data for both teams
-        # (This is simplified - you may need to adjust based on your data structure)
-        home_rest = 2  # Default
-        away_rest = 2
-        home_b2b = False
-        away_b2b = False
-        
-        game_dt = pd.Timestamp(game_date)
-        
-        home_data = self._rest_data[
-            (self._rest_data['Team'] == home_team) & 
-            (self._rest_data['gameDate'].dt.date == game_dt.date())
-        ]
-        if not home_data.empty:
-            home_rest = home_data.iloc[0].get('days_since_last_game', 2)
-            home_b2b = home_data.iloc[0].get('is_back_to_back', False)
-        
-        away_data = self._rest_data[
-            (self._rest_data['Team'] == away_team) &
-            (self._rest_data['gameDate'].dt.date == game_dt.date())
-        ]
-        if not away_data.empty:
-            away_rest = away_data.iloc[0].get('days_since_last_game', 2)
-            away_b2b = away_data.iloc[0].get('is_back_to_back', False)
-        
-        # Calculate adjustment
-        rest_diff = home_rest - away_rest
-        adjustment = rest_diff * self.config.rest.rest_advantage_per_day
-        adjustment = np.clip(adjustment, -self.config.rest.max_rest_advantage, 
-                           self.config.rest.max_rest_advantage)
-        
-        # B2B penalties
-        if home_b2b:
-            adjustment -= self.config.rest.b2b_penalty
-        if away_b2b:
-            adjustment += self.config.rest.b2b_penalty
-        
-        return adjustment
+        # Simplified for now
+        return 0.0
     
-    def _calculate_injury_adjustment(
-        self,
-        home_team: str,
-        away_team: str
-    ) -> Tuple[float, float]:
+    def _calculate_injury_adjustment(self, home_team: str, away_team: str) -> Tuple[float, float]:
         """Calculate injury-based point adjustments."""
         if self._injuries is None or self._injuries.empty:
             return 0.0, 0.0
@@ -380,20 +462,17 @@ class GamePredictor:
         home_adj = 0.0
         away_adj = 0.0
         
-        # Sum up injury impacts for each team
-        for team, adj_var in [(home_team, 'home_adj'), (away_team, 'away_adj')]:
+        for team, is_home in [(home_team, True), (away_team, False)]:
             team_injuries = self._injuries[
-                (self._injuries['Team'] == team) |
-                (self._injuries['PlayerName'].str.contains(team, case=False, na=False))
+                self._injuries['Team'].fillna('').str.contains(team.split()[-1], case=False, na=False) |
+                self._injuries['PlayerName'].fillna('').str.contains(team.split()[-1], case=False, na=False)
             ]
             
             if not team_injuries.empty and 'Impact' in team_injuries.columns:
-                # Impact is typically 0-1, convert to points
-                # A star player (impact=1.0) out = ~4 points
                 total_impact = team_injuries['Impact'].sum()
-                point_impact = -total_impact * 4  # Negative because injury hurts team
+                point_impact = -total_impact * 3
                 
-                if adj_var == 'home_adj':
+                if is_home:
                     home_adj = point_impact
                 else:
                     away_adj = point_impact
@@ -407,30 +486,14 @@ class GamePredictor:
         home_strength: TeamStrength,
         away_strength: TeamStrength
     ) -> float:
-        """
-        Calculate confidence in the prediction.
-        
-        Higher confidence when:
-        - Larger spread
-        - Lower spread uncertainty
-        - Teams have more games played
-        - Lower volatility teams
-        """
-        # Spread-based confidence
-        spread_conf = 1 - np.exp(-spread / 10)  # Approaches 1 for large spreads
-        
-        # Uncertainty-based
+        """Calculate confidence in the prediction."""
+        spread_conf = 1 - np.exp(-spread / 10)
         uncertainty_conf = 1 / (1 + spread_std / 10)
-        
-        # Sample size confidence
         min_games = min(home_strength.games_played, away_strength.games_played)
         sample_conf = min(1.0, min_games / 15)
-        
-        # Volatility penalty
         avg_volatility = (home_strength.volatility + away_strength.volatility) / 2
         vol_conf = 1 / (1 + avg_volatility / 15)
         
-        # Combine
         confidence = (spread_conf * 0.4 + uncertainty_conf * 0.3 + 
                      sample_conf * 0.2 + vol_conf * 0.1)
         
@@ -440,10 +503,7 @@ class GamePredictor:
         """Get current power rankings."""
         return self.strength_calc.power_rankings()
     
-    def predictions_to_dataframe(
-        self,
-        predictions: List[GamePrediction]
-    ) -> pd.DataFrame:
+    def predictions_to_dataframe(self, predictions: List[GamePrediction]) -> pd.DataFrame:
         """Convert list of predictions to DataFrame."""
         return pd.DataFrame([p.to_dict() for p in predictions])
 
@@ -452,17 +512,8 @@ class GamePredictor:
 # CONVENIENCE FUNCTIONS
 # =============================================================================
 
-def quick_predict(
-    home_team: str,
-    away_team: str,
-    verbose: bool = True
-) -> Optional[GamePrediction]:
-    """
-    Quick prediction for a single game.
-    
-    Usage:
-        pred = quick_predict("Boston Celtics", "Los Angeles Lakers")
-    """
+def quick_predict(home_team: str, away_team: str, verbose: bool = True) -> Optional[GamePrediction]:
+    """Quick prediction for a single game."""
     predictor = GamePredictor()
     predictor.prepare(verbose=False)
     
@@ -474,18 +525,26 @@ def quick_predict(
         print(f"   Score: {pred.away_score:.0f} - {pred.home_score:.0f}")
         print(f"   Spread: {pred.predicted_spread:+.1f}")
         print(f"   Total: {pred.predicted_total:.0f}")
-        print(f"   Confidence: {pred.confidence:.1%}")
+        
+        if pred.vegas and pred.vegas.vegas_spread is not None:
+            print(f"\n   📊 Vegas Comparison:")
+            print(f"      Vegas Spread: {pred.vegas.vegas_spread:+.1f}")
+            print(f"      Difference: {pred.vegas.spread_diff:+.1f}")
+            if pred.has_vegas_edge:
+                print(f"      ⭐ EDGE: Bet {pred.vegas.edge} ({pred.vegas.edge_size:.1f} pts)")
     
     return pred
 
 
 def predict_today(verbose: bool = True) -> List[GamePrediction]:
-    """
-    Predict all games scheduled for today.
-    
-    Usage:
-        predictions = predict_today()
-    """
+    """Predict all games scheduled for today."""
     predictor = GamePredictor()
     predictor.prepare(verbose=verbose)
     return predictor.predict_today(verbose=verbose)
+
+
+def find_edges(verbose: bool = True) -> List[GamePrediction]:
+    """Find games where QEPC disagrees with Vegas."""
+    predictor = GamePredictor()
+    predictor.prepare(verbose=False)
+    return predictor.find_edges()

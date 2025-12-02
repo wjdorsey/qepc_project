@@ -2,25 +2,9 @@
 #
 # Team strengths engine for QEPC experimental core (NBA-first).
 #
-# Input:  output of qepc.nba.data_loaders.load_nba_team_logs(...)
-#         with columns at least:
-#           gameDate (datetime, naive)
-#           teamCity, teamName
-#           teamScore, opponentScore
-#           home (0/1) [optional but useful]
-#           Season (string like "2014-15" or int)
-#
-# Output: strengths table with one row per team:
-#           Team          (e.g. "New Orleans Pelicans")
-#           SeasonMin     (earliest season year used)
-#           SeasonMax     (latest season year used)
-#           Games         (# games in sample)
-#           ORtg          (weighted points for per game)
-#           DRtg          (weighted points allowed per game)
-#           Pace          (weighted total points per game / 2)
-#           Volatility    (weighted std dev of teamScore)
-#
-# Heavily simplified vs real NBA analytics, but stable and easy to tune.
+# Input: output of qepc.nba.data_loaders.load_nba_team_logs(...)
+# Output: strengths_df with one row per team:
+#   Team, SeasonMin, SeasonMax, Games, ORtg, DRtg, Pace, Volatility
 
 from __future__ import annotations
 
@@ -47,13 +31,10 @@ class TeamStrengthsConfig:
 
 
 def _exp_weights(n: int, half_life: int) -> np.ndarray:
-    """
-    Exponential decay weights over n observations.
-    Most recent game has highest weight.
-    """
+    """Exponential decay weights over n observations (most recent highest)."""
     if n <= 0:
         return np.array([])
-    idx = np.arange(n)[::-1]  # 0 = most recent, ... last
+    idx = np.arange(n)[::-1]  # 0 = most recent
     lam = np.log(2.0) / max(1, half_life)
     w = np.exp(-lam * idx)
     return w / w.sum()
@@ -61,15 +42,11 @@ def _exp_weights(n: int, half_life: int) -> np.ndarray:
 
 def _infer_season_year_column(df: pd.DataFrame, cfg: TeamStrengthsConfig) -> pd.Series:
     """
-    Return a numeric 'SeasonYear' Series for use in lookback filters.
-    Priority:
-      1) Parse df["Season"] like "2014-15" -> 2014
-      2) If that fails, fall back to df["gameDate"].dt.year
+    Return a numeric 'SeasonYear' Series for lookback filters.
+    Prefer parsing Season like "2014-15" -> 2014; fall back to gameDate.year.
     """
     if "Season" in df.columns and cfg.use_season_year_from_season_col:
-        # Example: "2014-15", "2019-20", or maybe just "2014"
         season_str = df["Season"].astype(str)
-        # Keep first 4-digit group where possible
         year_str = season_str.str.extract(r"(\d{4})", expand=False)
         season_year = pd.to_numeric(year_str, errors="coerce")
 
@@ -78,12 +55,48 @@ def _infer_season_year_column(df: pd.DataFrame, cfg: TeamStrengthsConfig) -> pd.
             if season_year.notna().all():
                 return season_year.astype(int)
 
-        qwarn("Could not reliably parse numeric Season from 'Season' column; falling back to gameDate.year")
+        qwarn("Could not reliably parse Season; falling back to gameDate.year")
 
     if "gameDate" not in df.columns:
-        raise ValueError("Cannot infer season year; 'gameDate' missing and Season parsing failed.")
+        raise ValueError("Cannot infer season year; 'gameDate' missing.")
 
     return df["gameDate"].dt.year
+
+
+def _repair_opponent_scores(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If opponentScore looks basically zero everywhere (as in NBA_API_QEPC_Format),
+    repair it by using the other team's teamScore within each gameId.
+    """
+    if "opponentScore" not in df.columns or "teamScore" not in df.columns:
+        return df
+    if "gameId" not in df.columns:
+        return df
+
+    df = df.copy()
+
+    nonzero_frac = (df["opponentScore"] != 0).mean()
+    if nonzero_frac > 0.1:
+        # Already has meaningful opponent scores; nothing to do.
+        return df
+
+    qwarn(
+        "opponentScore appears mostly zero; repairing from gameId/teamScore "
+        "pairs (using the other team's score)."
+    )
+
+    def repair_group(g: pd.DataFrame) -> pd.DataFrame:
+        if len(g) != 2:
+            # Can't safely repair weird games; leave as-is.
+            return g
+        s0 = g.iloc[0]["teamScore"]
+        s1 = g.iloc[1]["teamScore"]
+        g.loc[g.index[0], "opponentScore"] = s1
+        g.loc[g.index[1], "opponentScore"] = s0
+        return g
+
+    df = df.groupby("gameId", group_keys=False).apply(repair_group)
+    return df
 
 
 # ---------------------------------------------------------------------
@@ -100,26 +113,15 @@ def compute_team_strengths(
     """
     Compute team strengths from multi-season NBA game logs.
 
-    Parameters
-    ----------
-    game_logs : DataFrame
-        Output of load_nba_team_logs, or equivalent schema.
-    config : TeamStrengthsConfig, optional
-        Tuning for lookback window, min games, recency weighting.
-    cutoff_date : Timestamp, optional
-        If provided, ignore games after this date (for historical backtests).
-    verbose : bool
-        If True, prints a short summary of the resulting strengths.
-
-    Returns
-    -------
-    strengths_df : DataFrame
-        One row per team, columns described at top of file.
+    Returns a DataFrame with:
+        Team, SeasonMin, SeasonMax, Games, ORtg, DRtg, Pace, Volatility
     """
     if config is None:
         config = TeamStrengthsConfig()
 
+    # Copy and repair opponent scores if needed
     df = game_logs.copy()
+    df = _repair_opponent_scores(df)
 
     # 1) Apply cutoff date if requested
     if cutoff_date is not None:
@@ -142,7 +144,7 @@ def compute_team_strengths(
             f"({df['SeasonYear'].nunique()} seasons, {len(df)} team-rows)"
         )
 
-    # 3) Build a canonical team key: "City Name"
+    # 3) Canonical team key
     df["TeamKey"] = df["teamCity"].astype(str).str.strip() + " " + df["teamName"].astype(str).str.strip()
 
     strengths_rows = []
@@ -161,8 +163,9 @@ def compute_team_strengths(
         # Weighted means (points per game)
         ORtg = float((pts_for * w).sum())
         DRtg = float((pts_against * w).sum())
+
         total_points = pts_for + pts_against
-        Pace = float((total_points * w).sum() / 2.0)  # per-team "pace" proxy
+        Pace = float((total_points * w).sum() / 2.0)  # per-team scoring rate
 
         # Weighted volatility of teamScore (std dev)
         mean_for = ORtg
