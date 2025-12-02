@@ -205,20 +205,38 @@ class DataLoader:
     # TEAM STATISTICS (Game-by-game for volatility)
     # =========================================================================
     
-    def load_team_stats(self, refresh: bool = False) -> pd.DataFrame:
+    def load_team_stats(self, refresh: bool = False, full_season: bool = True) -> pd.DataFrame:
         """
         Load game-by-game team statistics.
         
         Used for calculating volatility and recency-weighted stats.
-        """
-        if 'team_stats' in self._cache and not refresh:
-            return self._cache['team_stats']
         
-        paths = [
-            self.data_dir / "raw" / "team_game_logs_recent.csv",
-            self.data_dir / "raw" / "TeamStatistics.csv",
-            self.data_dir / "TeamStatistics.csv",
-        ]
+        Parameters
+        ----------
+        refresh : bool
+            Force reload from disk
+        full_season : bool
+            If True, prefer full season data (TeamStatistics.csv) - needed for backtesting
+            If False, prefer recent data (team_game_logs_recent.csv) - faster for daily predictions
+        """
+        cache_key = 'team_stats_full' if full_season else 'team_stats_recent'
+        
+        if cache_key in self._cache and not refresh:
+            return self._cache[cache_key]
+        
+        # Order depends on whether we need full season or just recent
+        if full_season:
+            paths = [
+                self.data_dir / "raw" / "TeamStatistics.csv",
+                self.data_dir / "TeamStatistics.csv",
+                self.data_dir / "raw" / "team_game_logs_recent.csv",
+            ]
+        else:
+            paths = [
+                self.data_dir / "raw" / "team_game_logs_recent.csv",
+                self.data_dir / "raw" / "TeamStatistics.csv",
+                self.data_dir / "TeamStatistics.csv",
+            ]
         
         df = self._load_first_available(paths, "Team Stats")
         
@@ -232,7 +250,7 @@ class DataLoader:
                 elif 'TEAM_NAME' in df.columns:
                     df['Team'] = df['TEAM_NAME']
             
-            self._cache['team_stats'] = df
+            self._cache[cache_key] = df
         
         return df
     
@@ -265,6 +283,9 @@ class DataLoader:
         
         paths = [
             self.data_dir / "injuries" / "current_injuries.csv",
+            self.data_dir / "raw" / "Injury_Overrides_live_espn.csv",
+            self.data_dir / "raw" / "Injury_Overrides_MASTER.csv",
+            self.data_dir / "raw" / "Injury_Overrides.csv",
             self.data_dir / "Injury_Overrides_live_espn.csv",
             self.data_dir / "injuries" / "Injury_Overrides_MASTER.csv",
         ]
@@ -286,6 +307,7 @@ class DataLoader:
             return self._cache['schedule_rest']
         
         paths = [
+            self.data_dir / "raw" / "Schedule_with_Rest.csv",
             self.data_dir / "Schedule_with_Rest.csv",
         ]
         
@@ -303,6 +325,7 @@ class DataLoader:
             return self._cache['team_form']
         
         paths = [
+            self.data_dir / "raw" / "TeamForm.csv",
             self.data_dir / "TeamForm.csv",
         ]
         
