@@ -457,3 +457,61 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Add to end of refresh_data.py (ESPN injuries for predictive entangler)
+
+def refresh_injuries(self) -> pd.DataFrame:
+    """Fetch live NBA injuries from ESPN, parse to QEPC CSV."""
+    url = "https://www.espn.com/nba/injuries"
+    print(f"🔗 Fetching injuries from {url}...")
+    
+    try:
+        # Load tables (one per team)
+        tables = pd.read_html(url)
+        injury_dfs = []
+        # Team list (30 NBA teams—matches ESPN tables)
+        teams = [
+            'Atlanta Hawks', 'Boston Celtics', 'Brooklyn Nets', 'Charlotte Hornets', 'Chicago Bulls',
+            'Cleveland Cavaliers', 'Dallas Mavericks', 'Denver Nuggets', 'Detroit Pistons', 'Golden State Warriors',
+            'Houston Rockets', 'Indiana Pacers', 'LA Clippers', 'Los Angeles Lakers', 'Memphis Grizzlies',
+            'Miami Heat', 'Milwaukee Bucks', 'Minnesota Timberwolves', 'New Orleans Pelicans', 'New York Knicks',
+            'Oklahoma City Thunder', 'Orlando Magic', 'Philadelphia 76ers', 'Phoenix Suns', 'Portland Trail Blazers',
+            'Sacramento Kings', 'San Antonio Spurs', 'Toronto Raptors', 'Utah Jazz', 'Washington Wizards'
+        ]
+        for i, df in enumerate(tables):
+            if i >= len(teams): break
+            df['team'] = teams[i]  # Assign team name
+            df.columns = df.columns.str.lower().str.strip()  # Clean column names
+            if 'status' in df.columns:
+                df = df.dropna(subset=['status'])  # Keep only injuries
+                df['injury_type'] = df.get('comment', '').str.extract(r'$$ ([^)]+) $$', expand=False).str.lower().fillna('unknown')
+                df['est_return'] = pd.to_datetime(df.get('est. return', ''), errors='coerce')
+                df['contrib_factor'] = 0.15  # Default; we'll tune with stats later
+                injury_dfs.append(df[['team', 'name', 'pos', 'status', 'injury_type', 'est_return', 'contrib_factor']])
+        
+        full_df = pd.concat(injury_dfs, ignore_index=True)
+        print(f"✅ Parsed {len(full_df)} active injuries.")
+        return full_df
+    except Exception as e:
+        print(f"❌ ESPN scrape failed: {e}. Using mock Dec 3, 2025 data.")
+        # Mock fallback (real examples from current date)
+        mock_data = {
+            'team': ['Boston Celtics', 'Indiana Pacers', 'Philadelphia 76ers', 'San Antonio Spurs'],
+            'name': ['Jayson Tatum', 'Tyrese Haliburton', 'Joel Embiid', 'Victor Wembanyama'],
+            'pos': ['F', 'G', 'C', 'F'],
+            'status': ['Out', 'Out', 'Out', 'Out'],
+            'injury_type': ['Achilles', 'Achilles', 'knee', 'calf'],
+            'est_return': pd.to_datetime(['2025-04-01', '2025-10-01', '2025-12-04', '2025-12-17']),
+            'contrib_factor': [0.32, 0.28, 0.35, 0.30]
+        }
+        return pd.DataFrame(mock_data)
+
+# Update main() to include --injuries flag (add these lines inside main(), before if args.setup:)
+import argparse
+# ... (existing parser code)
+parser.add_argument('--injuries', action='store_true', help='Refresh only injuries')
+# ...
+if args.injuries:
+    data = {'injuries': self.refresh_injuries()}
+    save_data(data)  # Your existing save function
+# ... (rest of main)

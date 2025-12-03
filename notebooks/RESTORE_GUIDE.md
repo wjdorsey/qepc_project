@@ -1,1 +1,0 @@
-"Restore guide coming soon."
