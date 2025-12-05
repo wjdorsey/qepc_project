@@ -1,3 +1,15 @@
 *.csv filter=lfs diff=lfs merge=lfs -text
 *.zip filter=lfs diff=lfs merge=lfs -text
 *.xls filter=lfs diff=lfs merge=lfs -text
+# Let Git auto-detect text files and normalize their line endings to LF in the repo
+* text=auto
+
+# Force LF for source code / docs
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Jupyter notebooks: treat as binary-ish to avoid annoying diffs and EOL munging
+*.ipynb -text
