@@ -102,7 +102,7 @@ def build_matchups_for_date(
         print(f"No games found for date {target}.")
         return games_day
 
-    # Select core columns
+        # Select core columns
     keep_cols = [
         "game_id",
         "game_datetime",
@@ -110,11 +110,25 @@ def build_matchups_for_date(
         "home_team_id",
         "away_team_id",
     ]
+
+    # Include team names/cities if available in games frame
+    for col in [
+        "home_team_name",
+        "home_team_city",
+        "away_team_name",
+        "away_team_city",
+    ]:
+        if col in games_day.columns:
+            keep_cols.append(col)
+
     score_cols = []
     for col in ["home_score", "away_score", "winner", "is_final"]:
         if col in games_day.columns:
             keep_cols.append(col)
             score_cols.append(col)
+
+    games_day = games_day[keep_cols]
+
 
     games_day = games_day[keep_cols]
 

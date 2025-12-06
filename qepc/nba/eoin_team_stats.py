@@ -84,8 +84,11 @@ def build_team_stats_from_eoin(
     agg["losses"] = agg["games_played"] - agg["wins"]
     agg["win_pct"] = agg["wins"] / agg["games_played"]
 
-    if pts_against is not None:
-        agg["pts_against"] = pts_against.values
+        # Points for / against
+    agg["pts_for"] = grouped[pts_for_col].sum(min_count=1)
+
+    if pts_against_col is not None:
+        agg["pts_against"] = grouped[pts_against_col].sum(min_count=1)
         agg["pts_diff"] = agg["pts_for"] - agg["pts_against"]
         agg["off_ppg"] = agg["pts_for"] / agg["games_played"]
         agg["def_ppg"] = agg["pts_against"] / agg["games_played"]
@@ -94,6 +97,22 @@ def build_team_stats_from_eoin(
         agg["pts_diff"] = pd.NA
         agg["off_ppg"] = agg["pts_for"] / agg["games_played"]
         agg["def_ppg"] = pd.NA
+
+    # --- NEW: rebounds and assists per game, if available ---
+    if "reboundstotal" in df.columns:
+        agg["reb_total"] = grouped["reboundstotal"].sum(min_count=1)
+        agg["reb_pg"] = agg["reb_total"] / agg["games_played"]
+    else:
+        agg["reb_total"] = pd.NA
+        agg["reb_pg"] = pd.NA
+
+    if "assists" in df.columns:
+        agg["ast_total"] = grouped["assists"].sum(min_count=1)
+        agg["ast_pg"] = agg["ast_total"] / agg["games_played"]
+    else:
+        agg["ast_total"] = pd.NA
+        agg["ast_pg"] = pd.NA
+
 
     return agg
 
