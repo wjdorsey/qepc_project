@@ -1,8 +1,25 @@
 """
-QEPC NBA: Team stats builder from Eoin team_boxes_qepc.
+QEPC NBA: Team-level stats built from Eoin team_boxes_qepc.
 
-This builds a Team_Stats-style table from the Eoin Kaggle team game logs,
-so the rest of QEPC can use it as a drop-in data source.
+We expect team_boxes_qepc (already normalized) to have columns like:
+
+    - game_id
+    - team_id
+    - team_name
+    - win              (1 if this team won the game, 0 otherwise)
+    - teamscore        (this team's points in the game)
+    - opponentscore    (opponent's points in the game)
+    - reboundstotal    (this team's total rebounds in the game)
+    - assists          (this team's total assists in the game)
+
+We aggregate to a per-team table with:
+
+    - games_played
+    - wins, losses, win_pct
+    - pts_for, pts_against, pts_diff
+    - off_ppg, def_ppg
+    - reb_total, reb_pg               (if reboundstotal exists)
+    - ast_total, ast_pg               (if assists exists)
 """
 
 from __future__ import annotations
@@ -14,27 +31,24 @@ import pandas as pd
 
 from .eoin_data_source import load_eoin_team_boxes, get_project_root
 
-# ---------------------------------------------------------------------------
-# Configuration: match these to your Eoin TeamStatistics schema
-# ---------------------------------------------------------------------------
-
-# From your column list:
-#   'teamscore'       -> points scored by the team
-#   'opponentscore'   -> points allowed
-TEAM_POINTS_FOR_COL = "teamscore"
-TEAM_POINTS_AGAINST_COL = "opponentscore"
-
 
 def build_team_stats_from_eoin(
     team_boxes: Optional[pd.DataFrame] = None,
     project_root: Optional[Path] = None,
 ) -> pd.DataFrame:
     """
-    Build a Team_Stats-style aggregate from Eoin team_boxes_qepc.
+    Aggregate Eoin team_boxes_qepc into a per-team stats table.
 
-    Aggregates by team_id.
+    Parameters
+    ----------
+    team_boxes : DataFrame, optional
+        If None, this will call load_eoin_team_boxes(project_root).
+    project_root : Path, optional
+        QEPC project root; only used if we need to load data.
 
-    Output columns (at minimum):
+    Returns
+    -------
+    DataFrame with at least:
         - team_id
         - games_played
         - wins
@@ -43,16 +57,24 @@ def build_team_stats_from_eoin(
         - pts_for
         - pts_against
         - pts_diff
-        - off_ppg (points_for per game)
-        - def_ppg (points_against per game)
+        - off_ppg
+        - def_ppg
+        - reb_total, reb_pg      (if reboundstotal exists)
+        - ast_total, ast_pg      (if assists exists)
     """
     if team_boxes is None:
         team_boxes = load_eoin_team_boxes(project_root)
 
     df = team_boxes.copy()
 
-    # Basic sanity check
-    required_cols = ["team_id", "win", TEAM_POINTS_FOR_COL]
+    # Required columns we expect from your normalized team_boxes_qepc
+    required_cols = [
+        "team_id",
+        "game_id",
+        "win",
+        "teamscore",
+        "opponentscore",
+    ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(
@@ -60,59 +82,46 @@ def build_team_stats_from_eoin(
             "Check your normalization/rename step."
         )
 
-    # Group by team_id (later you can add 'season' and group by ['season', 'team_id'])
-    grouped = df.groupby("team_id", dropna=False)
+    has_reb = "reboundstotal" in df.columns
+    has_ast = "assists" in df.columns
 
-    # Core aggregates
-    games_played = grouped["game_id"].count()
-    wins = grouped["win"].sum(min_count=1)
-    pts_for = grouped[TEAM_POINTS_FOR_COL].sum(min_count=1)
+    # Group by team_id (you can later add season and group by [season, team_id])
+    group_keys = ["team_id"]
+    grouped = df.groupby(group_keys)
 
-    if TEAM_POINTS_AGAINST_COL in df.columns:
-        pts_against = grouped[TEAM_POINTS_AGAINST_COL].sum(min_count=1)
-    else:
-        pts_against = None
+    agg = pd.DataFrame(index=grouped.size().index)
 
-    # Assemble into a DataFrame
-    agg = pd.DataFrame({
-        "team_id": games_played.index,
-        "games_played": games_played.values,
-        "wins": wins.values,
-        "pts_for": pts_for.values,
-    })
-
+    # Basic counts
+    agg["games_played"] = grouped["game_id"].nunique()
+    agg["wins"] = grouped["win"].sum(min_count=1)
     agg["losses"] = agg["games_played"] - agg["wins"]
     agg["win_pct"] = agg["wins"] / agg["games_played"]
 
-        # Points for / against
-    agg["pts_for"] = grouped[pts_for_col].sum(min_count=1)
+    # Points for / against
+    agg["pts_for"] = grouped["teamscore"].sum(min_count=1)
+    agg["pts_against"] = grouped["opponentscore"].sum(min_count=1)
+    agg["pts_diff"] = agg["pts_for"] - agg["pts_against"]
+    agg["off_ppg"] = agg["pts_for"] / agg["games_played"]
+    agg["def_ppg"] = agg["pts_against"] / agg["games_played"]
 
-    if pts_against_col is not None:
-        agg["pts_against"] = grouped[pts_against_col].sum(min_count=1)
-        agg["pts_diff"] = agg["pts_for"] - agg["pts_against"]
-        agg["off_ppg"] = agg["pts_for"] / agg["games_played"]
-        agg["def_ppg"] = agg["pts_against"] / agg["games_played"]
-    else:
-        agg["pts_against"] = pd.NA
-        agg["pts_diff"] = pd.NA
-        agg["off_ppg"] = agg["pts_for"] / agg["games_played"]
-        agg["def_ppg"] = pd.NA
-
-    # --- NEW: rebounds and assists per game, if available ---
-    if "reboundstotal" in df.columns:
+    # Rebounds per game (if available)
+    if has_reb:
         agg["reb_total"] = grouped["reboundstotal"].sum(min_count=1)
         agg["reb_pg"] = agg["reb_total"] / agg["games_played"]
     else:
         agg["reb_total"] = pd.NA
         agg["reb_pg"] = pd.NA
 
-    if "assists" in df.columns:
+    # Assists per game (if available)
+    if has_ast:
         agg["ast_total"] = grouped["assists"].sum(min_count=1)
         agg["ast_pg"] = agg["ast_total"] / agg["games_played"]
     else:
         agg["ast_total"] = pd.NA
         agg["ast_pg"] = pd.NA
 
+    # Move team_id back to a normal column
+    agg = agg.reset_index()
 
     return agg
 
@@ -123,7 +132,7 @@ def save_team_stats_to_cache(
     filename: str = "eoin_team_stats.parquet",
 ) -> Path:
     """
-    Save the aggregated team stats to cache/imports as a parquet file.
+    Save the per-team stats table to cache/imports as parquet.
     """
     if project_root is None:
         project_root = get_project_root()
@@ -136,4 +145,5 @@ def save_team_stats_to_cache(
 
     out_path = cache_dir / filename
     team_stats.to_parquet(out_path, index=False)
+    print(f"Saved team_stats to: {out_path}")
     return out_path
