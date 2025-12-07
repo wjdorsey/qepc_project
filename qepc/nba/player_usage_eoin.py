@@ -12,6 +12,10 @@ This builds a per-player table with:
 
 We aggregate by (player_id, team_name) so a player who changes teams
 appears once per team.
+
+NEW (quantum-flavored):
+    Optionally use recency-weighted averages via an exponential
+    "decoherence" time scale tau_days, so recent games matter more.
 """
 
 from __future__ import annotations
@@ -19,9 +23,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from .eoin_data_source import load_eoin_player_boxes, get_project_root
+from qepc.quantum.decoherence import exponential_time_weights
 
 
 def build_player_usage_from_eoin(
@@ -29,6 +35,11 @@ def build_player_usage_from_eoin(
     min_games: int = 10,
     project_root: Optional[Path] = None,
     cutoff_date: str = "2024-10-01",
+    use_recency_weights: bool = True,
+    tau_points_days: float = 30.0,
+    tau_rebounds_days: Optional[float] = None,
+    tau_assists_days: Optional[float] = None,
+    clip_days: float = 120.0,
 ) -> pd.DataFrame:
     """
     Build per-player usage stats from Eoin player_boxes_qepc.
@@ -43,6 +54,17 @@ def build_player_usage_from_eoin(
         QEPC project root; used only if we need to load data.
     cutoff_date : str
         Only use games on/after this date (YYYY-MM-DD), if 'game_date' exists.
+    use_recency_weights : bool
+        If True and 'game_date' exists, use exponential time decay to weight
+        games (decoherence). If False, use simple unweighted means.
+    tau_points_days : float
+        Time constant (days) for points-related weighting.
+    tau_rebounds_days : float or None
+        Time constant for rebounds. If None, uses tau_points_days.
+    tau_assists_days : float or None
+        Time constant for assists. If None, uses tau_points_days.
+    clip_days : float
+        Cap Δdays at this many days; older games all get ~the same small weight.
 
     Returns
     -------
@@ -64,7 +86,7 @@ def build_player_usage_from_eoin(
 
     df = player_boxes.copy()
 
-    # --- Required columns ---
+    # --- Required base columns ---
     required_cols = ["player_id", "team_name", "game_id", "points"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
@@ -73,26 +95,26 @@ def build_player_usage_from_eoin(
             "Check your normalization/rename step."
         )
 
-    # --- Optional stat/name columns ---
+    # --- Optional stat/name/date columns ---
     has_reb = "reboundstotal" in df.columns
     has_ast = "assists" in df.columns
     has_min = "numminutes" in df.columns
     has_first = "firstname" in df.columns
     has_last = "lastname" in df.columns
+    has_date = "game_date" in df.columns
 
-    # --- Optional: limit to recent games only ---
-    if "game_date" in df.columns and cutoff_date is not None:
+    # Optional: limit to recent games only
+    if has_date and cutoff_date is not None:
         cutoff = pd.to_datetime(cutoff_date).date()
         df = df[df["game_date"] >= cutoff].copy()
 
-    # If we filtered everything out, bail early
     if df.empty:
         raise ValueError(
             f"No player box rows remain after applying cutoff_date={cutoff_date}. "
             "You may want to loosen the cutoff_date or check game_date values."
         )
 
-    # --- Team keys & team totals per game ---
+    # --- Build per-game team totals so we can compute shares ---
     df["team_key"] = df["team_name"]
 
     # Team game points (for points share)
@@ -114,7 +136,7 @@ def build_player_usage_from_eoin(
             df["team_game_rebounds"] != 0, other=1
         )
     else:
-        df["rebounds_share"] = pd.NA
+        df["rebounds_share"] = np.nan
 
     # Team game assists (for assists share)
     if has_ast:
@@ -125,62 +147,155 @@ def build_player_usage_from_eoin(
             df["team_game_assists"] != 0, other=1
         )
     else:
-        df["assists_share"] = pd.NA
+        df["assists_share"] = np.nan
 
-    # --- Aggregate by (player_id, team) ---
+    # --- Recency weights (decoherence) ---
+    use_rw = use_recency_weights and has_date
+    if use_rw:
+        # If not provided, reuse points tau
+        if tau_rebounds_days is None:
+            tau_rebounds_days = tau_points_days
+        if tau_assists_days is None:
+            tau_assists_days = tau_points_days
 
+        # Raw (unnormalized) weights per row; we normalize within groups later
+        w_pts = exponential_time_weights(
+            df["game_date"],
+            ref_date=None,
+            tau_days=tau_points_days,
+            clip_days=clip_days,
+            normalize=False,
+        )
+        df["w_pts"] = w_pts
+
+        if has_reb:
+            w_reb = exponential_time_weights(
+                df["game_date"],
+                ref_date=None,
+                tau_days=tau_rebounds_days,
+                clip_days=clip_days,
+                normalize=False,
+            )
+            df["w_reb"] = w_reb
+        else:
+            df["w_reb"] = np.nan
+
+        if has_ast:
+            w_ast = exponential_time_weights(
+                df["game_date"],
+                ref_date=None,
+                tau_days=tau_assists_days,
+                clip_days=clip_days,
+                normalize=False,
+            )
+            df["w_ast"] = w_ast
+        else:
+            df["w_ast"] = np.nan
+    else:
+        df["w_pts"] = 1.0
+        df["w_reb"] = 1.0
+        df["w_ast"] = 1.0
+
+    # --- Aggregate by (player_id, team) with weighted means ---
     group_keys = ["player_id", "team_key"]
 
-    # Use older-pandas-friendly agg: column -> function
-    agg_dict = {
-        "game_id": "nunique",
-        "points": "mean",
-        "points_share": "mean",
-        "rebounds_share": "mean",
-        "assists_share": "mean",
-    }
+    rows = []
+    grouped = df.groupby(group_keys)
 
-    if has_reb:
-        agg_dict["reboundstotal"] = "mean"
-    if has_ast:
-        agg_dict["assists"] = "mean"
-    if has_min:
-        agg_dict["numminutes"] = "mean"
-    if has_first:
-        agg_dict["firstname"] = "first"
-    if has_last:
-        agg_dict["lastname"] = "first"
+    for keys, g in grouped:
+        player_id, team_key = keys
 
-    grouped = df.groupby(group_keys).agg(agg_dict).reset_index()
+        # games_played is still unweighted count of distinct games
+        games_played = g["game_id"].nunique()
 
-    # --- Rename to nicer column names ---
+        if games_played < min_games:
+            continue
 
-    grouped = grouped.rename(
-        columns={
-            "game_id": "games_played",
-            "team_key": "team_name",
-            "points": "avg_points",
-            "reboundstotal": "avg_rebounds",
-            "assists": "avg_assists",
-            "numminutes": "avg_minutes",
-            "points_share": "mean_points_share",
-            "rebounds_share": "mean_rebounds_share",
-            "assists_share": "mean_assists_share",
+        row = {
+            "player_id": player_id,
+            "team_name": team_key,
+            "games_played": int(games_played),
         }
-    )
 
-    # --- Build a display name if possible ---
-    if has_first and has_last:
-        grouped["player_name"] = (
-            grouped["firstname"].astype(str).str.strip()
+        # Names
+        if has_first:
+            row["firstname"] = str(g["firstname"].iloc[0]).strip()
+        if has_last:
+            row["lastname"] = str(g["lastname"].iloc[0]).strip()
+
+        # Points-related weighted averages
+        w_pts = g["w_pts"].to_numpy(dtype=float)
+        total_w_pts = w_pts.sum()
+
+        if total_w_pts > 0:
+            pts = g["points"].to_numpy(dtype=float)
+            pts_share = g["points_share"].to_numpy(dtype=float)
+
+            row["avg_points"] = float((w_pts * pts).sum() / total_w_pts)
+            row["mean_points_share"] = float((w_pts * pts_share).sum() / total_w_pts)
+        else:
+            row["avg_points"] = np.nan
+            row["mean_points_share"] = np.nan
+
+        # Rebounds-related
+        if has_reb:
+            w_reb = g["w_reb"].to_numpy(dtype=float)
+            total_w_reb = w_reb.sum()
+            if total_w_reb > 0:
+                reb = g["reboundstotal"].to_numpy(dtype=float)
+                reb_share = g["rebounds_share"].to_numpy(dtype=float)
+                row["avg_rebounds"] = float((w_reb * reb).sum() / total_w_reb)
+                row["mean_rebounds_share"] = float(
+                    (w_reb * reb_share).sum() / total_w_reb
+                )
+            else:
+                row["avg_rebounds"] = np.nan
+                row["mean_rebounds_share"] = np.nan
+        else:
+            row["avg_rebounds"] = np.nan
+            row["mean_rebounds_share"] = np.nan
+
+        # Assists-related
+        if has_ast:
+            w_ast = g["w_ast"].to_numpy(dtype=float)
+            total_w_ast = w_ast.sum()
+            if total_w_ast > 0:
+                ast = g["assists"].to_numpy(dtype=float)
+                ast_share = g["assists_share"].to_numpy(dtype=float)
+                row["avg_assists"] = float((w_ast * ast).sum() / total_w_ast)
+                row["mean_assists_share"] = float(
+                    (w_ast * ast_share).sum() / total_w_ast
+                )
+            else:
+                row["avg_assists"] = np.nan
+                row["mean_assists_share"] = np.nan
+        else:
+            row["avg_assists"] = np.nan
+            row["mean_assists_share"] = np.nan
+
+        # Minutes: we can just use points weights as a proxy if available
+        if has_min:
+            if use_rw and total_w_pts > 0:
+                mins = g["numminutes"].to_numpy(dtype=float)
+                row["avg_minutes"] = float((w_pts * mins).sum() / total_w_pts)
+            else:
+                row["avg_minutes"] = float(g["numminutes"].astype(float).mean())
+        else:
+            row["avg_minutes"] = np.nan
+
+        rows.append(row)
+
+    grouped_usage = pd.DataFrame(rows).reset_index(drop=True)
+
+    # Build a display name if possible
+    if has_first and has_last and not grouped_usage.empty:
+        grouped_usage["player_name"] = (
+            grouped_usage["firstname"].astype(str).str.strip()
             + " "
-            + grouped["lastname"].astype(str).str.strip()
+            + grouped_usage["lastname"].astype(str).str.strip()
         )
 
-    # --- Filter out fringe guys with very few games ---
-    grouped = grouped[grouped["games_played"] >= min_games].reset_index(drop=True)
-
-    return grouped
+    return grouped_usage
 
 
 def save_player_usage_to_cache(
