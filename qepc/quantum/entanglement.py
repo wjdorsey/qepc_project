@@ -1,33 +1,23 @@
 """
 QEPC Quantum: Entanglement / co-movement utilities.
 
-The idea here is to measure how much two players' stats "move together"
-within the same team context – a crude, but useful, stand-in for the
-"entangled" relationship in the QEPC metaphor.
+We measure how much two players' stats "move together" within the same
+team context — a simple stand-in for the "entangled" relationship.
 
-We start simple:
-    - For a given team_name and stat (e.g. points, assists),
-      look at all games in player_boxes_qepc.
-    - Build a game-by-player matrix of that stat.
-    - Compute a correlation matrix across players.
-    - Return a tidy DataFrame of pairwise correlations
-      with the number of shared games.
-
-Later, we can:
-    - Do cross-stat entanglement (e.g., Tatum PTS vs Brown AST).
-    - Condition on scripts, fatigue states, etc.
+Implementation here is deliberately explicit and avoids fancy
+stack/reset_index tricks so it behaves consistently across pandas versions.
 """
 
 from __future__ import annotations
 
-from typing import Optional, List, Tuple
+from typing import Optional, Union
 from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
 
 
-DateLike = date | datetime | str | pd.Timestamp
+DateLike = Union[date, datetime, str, pd.Timestamp]
 
 
 def _make_player_name_map(df_team: pd.DataFrame) -> dict[int, str]:
@@ -89,7 +79,7 @@ def build_team_entanglement(
         Which stat to use for co-movement (e.g., "points", "assists").
     min_shared_games : int
         Minimum number of games two players must both appear in to compute
-        a correlation. Pairs with fewer shared games will have NaN corr.
+        a correlation. Pairs with fewer shared games will be skipped.
     date_col : str or None
         If provided and cutoff_date is not None, we filter out games before
         cutoff_date using this column.
@@ -100,11 +90,12 @@ def build_team_entanglement(
     -------
     DataFrame with columns:
         - player_id_a
-        - player_id_b
-        - corr          (Pearson correlation of game-level stat)
-        - n_shared_games
         - player_name_a
+        - player_id_b
         - player_name_b
+        - corr          (Pearson correlation of game-level stat)
+        - abs_corr
+        - n_shared_games
     """
     df = player_boxes.copy()
 
@@ -140,68 +131,141 @@ def build_team_entanglement(
         aggfunc="sum",  # if duplicate rows, sum within game
     )
 
-    # How many games each pair both have non-NA?
-    valid_mask = ~pivot.isna()
-    shared_counts = valid_mask.T @ valid_mask
+    # If we have fewer than 2 players with data, nothing to correlate
+    if pivot.shape[1] < 2:
+        return pd.DataFrame(
+            columns=[
+                "player_id_a",
+                "player_name_a",
+                "player_id_b",
+                "player_name_b",
+                "corr",
+                "abs_corr",
+                "n_shared_games",
+            ]
+        )
 
-    # Correlation matrix with min_shared_games threshold
+    # Compute correlation matrix (as a DataFrame)
     corr_mat = pivot.corr(min_periods=min_shared_games)
 
-    # Give distinct names to the axes so reset_index doesn't collide
-    corr_mat.index.name = "player_id_a"
-    corr_mat.columns.name = "player_id_b"
-
-    # Tidy long-form DataFrame
-    corr_long = corr_mat.stack(dropna=False).reset_index(name="corr")
-
-    # Filter out self-corr and NaNs, keep each pair once (a < b)
-    corr_long = corr_long[
-        (corr_long["player_id_a"] < corr_long["player_id_b"])
-        & corr_long["corr"].notna()
-    ].copy()
-
-    # How many games each pair both have non-NA?
+    # Compute shared game counts (as a plain numpy matrix)
     valid_mask = ~pivot.isna()
-    shared_counts = valid_mask.T @ valid_mask
+    shared_counts = valid_mask.T @ valid_mask  # DataFrame
 
-    n_shared = (
-        shared_counts.stack()
-        .reset_index()
-        .rename(
-            columns={
-                0: "n_shared_games",
-                "level_0": "player_id_a",
-                "level_1": "player_id_b",
+    player_ids = list(pivot.columns)
+    n_players = len(player_ids)
+
+    rows = []
+
+    for i in range(n_players):
+        for j in range(i + 1, n_players):
+            pid_a = int(player_ids[i])
+            pid_b = int(player_ids[j])
+
+            # How many games both have valid stats in
+            n_shared = int(shared_counts.iloc[i, j])
+            if n_shared < min_shared_games:
+                continue
+
+            corr = float(corr_mat.iloc[i, j])
+            if np.isnan(corr):
+                continue
+
+            name_a = name_map.get(pid_a, f"player_{pid_a}")
+            name_b = name_map.get(pid_b, f"player_{pid_b}")
+
+            rows.append(
+                {
+                    "player_id_a": pid_a,
+                    "player_name_a": name_a,
+                    "player_id_b": pid_b,
+                    "player_name_b": name_b,
+                    "corr": corr,
+                    "abs_corr": abs(corr),
+                    "n_shared_games": n_shared,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "player_id_a",
+                "player_name_a",
+                "player_id_b",
+                "player_name_b",
+                "corr",
+                "abs_corr",
+                "n_shared_games",
+            ]
+        )
+
+    ent_df = pd.DataFrame(rows)
+    ent_df = ent_df.sort_values("abs_corr", ascending=False).reset_index(drop=True)
+    return ent_df
+
+
+def get_player_entanglement_view(
+    ent_df: pd.DataFrame,
+    player_id: int,
+    min_shared_games: int = 5,
+) -> pd.DataFrame:
+    """
+    Given a team entanglement DataFrame, extract all pairs involving `player_id`
+    and return a tidy view with the "partner" player and correlation.
+
+    Parameters
+    ----------
+    ent_df : DataFrame
+        Output of build_team_entanglement.
+    player_id : int
+        Player to focus on.
+    min_shared_games : int
+        Filter out pairs with fewer shared games than this.
+
+    Returns
+    -------
+    DataFrame with:
+        - player_id
+        - player_name
+        - partner_id
+        - partner_name
+        - corr
+        - abs_corr
+        - n_shared_games
+    """
+    pid = int(player_id)
+
+    mask_a = ent_df["player_id_a"] == pid
+    mask_b = ent_df["player_id_b"] == pid
+    sub = ent_df[mask_a | mask_b].copy()
+
+    if sub.empty:
+        return sub
+
+    rows = []
+    for _, row in sub.iterrows():
+        if row["player_id_a"] == pid:
+            player_name = row["player_name_a"]
+            partner_id = row["player_id_b"]
+            partner_name = row["player_name_b"]
+        else:
+            player_name = row["player_name_b"]
+            partner_id = row["player_id_a"]
+            partner_name = row["player_name_a"]
+
+        rows.append(
+            {
+                "player_id": pid,
+                "player_name": player_name,
+                "partner_id": int(partner_id),
+                "partner_name": partner_name,
+                "corr": float(row["corr"]),
+                "abs_corr": float(row["abs_corr"]),
+                "n_shared_games": int(row["n_shared_games"]),
             }
         )
-    )
 
-    corr_long = corr_long.merge(
-        n_shared, on=["player_id_a", "player_id_b"], how="left"
-    )
-
-    # Attach names if available
-    def map_name(pid: int) -> str:
-        try:
-            return name_map[int(pid)]
-        except Exception:
-            return f"player_{int(pid)}"
-
-    corr_long["player_name_a"] = corr_long["player_id_a"].astype(int).map(map_name)
-    corr_long["player_name_b"] = corr_long["player_id_b"].astype(int).map(map_name)
-
-    # Sort by absolute correlation, strongest first
-    corr_long["abs_corr"] = corr_long["corr"].abs()
-    corr_long = corr_long.sort_values("abs_corr", ascending=False).reset_index(drop=True)
-
-    return corr_long[
-        [
-            "player_id_a",
-            "player_name_a",
-            "player_id_b",
-            "player_name_b",
-            "corr",
-            "abs_corr",
-            "n_shared_games",
-        ]
-    ]
+    out = pd.DataFrame(rows)
+    out = out[out["n_shared_games"] >= min_shared_games].copy()
+    out = out.sort_values("abs_corr", ascending=False).reset_index(drop=True)
+    return out

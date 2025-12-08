@@ -175,3 +175,39 @@ git push
 ```
 
 That’s the clean “no drama” path. Treat LFS rules like traffic signs: put them up *before* you let the big trucks onto the road.
+
+
+
+In a **JupyterLab terminal** that’s running a normal Linux-style shell (bash/zsh), the “force delete a folder and everything in it” command is:
+
+```bash
+rm -rf folder_name
+```
+
+Breakdown:
+
+* `rm` = remove
+* `-r` = recursive (go into subfolders)
+* `-f` = force (don’t prompt, ignore read-only)
+
+Example:
+
+```bash
+rm -rf notebooks/01_core
+```
+
+If the folder name has spaces:
+
+```bash
+rm -rf "some folder name"
+```
+
+If the folder is empty and you want the “nice” version instead of the nuke:
+
+```bash
+rmdir folder_name
+```
+
+But 99% of the time people just use `rm -rf`.
+As always, double-check with `ls` first that you’re in the right directory, because `rm -rf` does not come with an undo button.
+
