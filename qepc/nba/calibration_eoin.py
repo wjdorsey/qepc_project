@@ -1,18 +1,19 @@
 # qepc/nba/calibration_eoin.py
 
 """
-Calibration constants for Eoin-based NBA team total model.
+Calibration constants for the Eoin-based NBA team total model.
 
 These were fit on ~1,800 games from the Eoin dataset
-(2024-10-01 onward, modern-era strengths) using a linear
-mapping: actual ≈ m * pred + b.
+(2024-10-04 onward, strengths built from 2022-10-01+ games)
+using a linear mapping: actual ≈ m * pred + b.
 """
 
-HOME_M = 1.556
-HOME_B = -56.346
+# Paste the numbers from your notebook output:
+HOME_M = 1.916
+HOME_B = -105.818
 
-AWAY_M = 1.664
-AWAY_B = -70.100
+AWAY_M = 1.997
+AWAY_B = -112.937
 
 
 def calibrate_team_totals(raw_home: float, raw_away: float) -> tuple[float, float]:
