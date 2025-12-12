@@ -19,8 +19,9 @@ from typing import Optional
 
 import pandas as pd
 
+from qepc.utils.paths import get_project_root
+
 from .eoin_team_stats import build_team_stats_from_eoin
-from .eoin_data_source import get_project_root
 
 
 @dataclass

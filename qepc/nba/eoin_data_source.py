@@ -28,22 +28,13 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
+from qepc.utils.paths import get_project_root
 
-# ---------------------------------------------------------------------------
-# Paths / configuration
-# ---------------------------------------------------------------------------
-
-def get_project_root() -> Path:
-    """
-    Infer the qepc_project root based on this file's location.
-
-    Assumes this file lives at:
-        <project_root>/qepc/nba/eoin_data_source.py
-    """
-    here = Path(__file__).resolve()
-    # .../qepc/nba/eoin_data_source.py -> .../qepc_project
-    return here.parents[2]
-
+from .schema import (
+    validate_games,
+    validate_player_boxes,
+    validate_team_boxes,
+)
 
 def get_cache_imports_dir(project_root: Optional[Path] = None) -> Path:
     if project_root is None:
@@ -75,6 +66,18 @@ def _check_file_exists(path: Path, label: str) -> None:
         )
 
 
+def _read_parquet_safe(path: Path) -> pd.DataFrame:
+    """Read parquet with a clear message if dependencies are missing."""
+
+    try:
+        return pd.read_parquet(path)
+    except ImportError as exc:  # pyarrow / fastparquet missing
+        raise ImportError(
+            "Reading parquet requires optional dependency 'pyarrow' or 'fastparquet'. "
+            "Install one of them (e.g., pip install pyarrow) to load QEPC caches."
+        ) from exc
+
+
 def load_eoin_games(project_root: Optional[Path] = None) -> pd.DataFrame:
     """
     Load the QEPC-ready games table from Eoin parquet.
@@ -92,8 +95,8 @@ def load_eoin_games(project_root: Optional[Path] = None) -> pd.DataFrame:
     paths = get_eoin_parquet_paths(project_root)
     path = paths["games"]
     _check_file_exists(path, "games")
-    df = pd.read_parquet(path)
-    return df
+    df = _read_parquet_safe(path)
+    return validate_games(df)
 
 
 def load_eoin_player_boxes(project_root: Optional[Path] = None) -> pd.DataFrame:
@@ -112,8 +115,8 @@ def load_eoin_player_boxes(project_root: Optional[Path] = None) -> pd.DataFrame:
     paths = get_eoin_parquet_paths(project_root)
     path = paths["player_boxes"]
     _check_file_exists(path, "player_boxes")
-    df = pd.read_parquet(path)
-    return df
+    df = _read_parquet_safe(path)
+    return validate_player_boxes(df)
 
 
 def load_eoin_team_boxes(project_root: Optional[Path] = None) -> pd.DataFrame:
@@ -131,8 +134,8 @@ def load_eoin_team_boxes(project_root: Optional[Path] = None) -> pd.DataFrame:
     paths = get_eoin_parquet_paths(project_root)
     path = paths["team_boxes"]
     _check_file_exists(path, "team_boxes")
-    df = pd.read_parquet(path)
-    return df
+    df = _read_parquet_safe(path)
+    return validate_team_boxes(df)
 
 
 # ---------------------------------------------------------------------------

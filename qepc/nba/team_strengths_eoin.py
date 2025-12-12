@@ -15,8 +15,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from qepc.utils.paths import get_project_root
+
 from .eoin_team_stats import build_team_stats_from_eoin
-from .eoin_data_source import get_project_root
 
 
 def _safe_zscore(series: pd.Series) -> pd.Series:
@@ -34,6 +35,8 @@ def _safe_zscore(series: pd.Series) -> pd.Series:
 def calculate_advanced_strengths_from_eoin(
     team_stats: Optional[pd.DataFrame] = None,
     project_root: Optional[Path] = None,
+    cutoff_date: Optional[pd.Timestamp] = None,
+    start_date: Optional[pd.Timestamp] = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
@@ -62,7 +65,11 @@ def calculate_advanced_strengths_from_eoin(
         - strength_rank (1 = strongest)
     """
     if team_stats is None:
-        team_stats = build_team_stats_from_eoin(project_root=project_root)
+        team_stats = build_team_stats_from_eoin(
+            project_root=project_root,
+            cutoff_date=cutoff_date,
+            start_date=start_date,
+        )
 
     df = team_stats.copy()
 
