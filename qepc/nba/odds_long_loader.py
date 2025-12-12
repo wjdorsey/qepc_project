@@ -1,17 +1,33 @@
-"""Long-horizon NBA odds loader with resilient team-code mapping.
+"""
+Long-horizon NBA odds loader with resilient team-code mapping.
 
-Outputs a tidy odds table with columns like:
+Loads the Kaggle odds dataset (nba_2008-2025.csv) and normalizes it into a QEPC-friendly table,
+then attaches odds to the Eoin games parquet.
+
+Key goals:
+- No hardcoded machine/user paths (PROJECT_ROOT auto-detect)
+- Robust team normalization (abbr, legacy abbr, and full team names)
+- Stable join keys:
+    game_date_join (Eastern-local calendar date, tz-naive) + home_team_id + away_team_id
+- Diagnostics to understand coverage
+
+Raw odds columns (your Kaggle file):
+- season, date, regular, playoffs, away, home,
+  score_away, score_home, whos_favored, spread, total,
+  moneyline_away, moneyline_home, ...
+
+Normalized output columns:
 - season
-- game_date
-- game_key
-- home_code / away_code
-- score_home / score_away
-- spread_home / spread_away
+- game_date (datetime64[ns] normalized midnight; derived from raw "date")
+- game_key (YYYY-MM-DD_AWAY_HOME)
+- away_code, home_code (canonical tricode)
+- away_team_id, home_team_id
+- score_away, score_home
+- spread_home, spread_away
 - total_points
-- moneyline_home / moneyline_away
-- p_home / p_away (vig-stripped implied win probs)
-- regular / playoffs flags
-- join diagnostics helpers
+- moneyline_away, moneyline_home
+- p_away, p_home (vig-stripped implied win probabilities)
+- regular, playoffs
 """
 
 from __future__ import annotations
@@ -35,28 +51,101 @@ DEFAULT_ODDS_CSV: Path = (
 )
 
 # ---------------------------------------------------------------------
-# Team code normalization
+# Team normalization
 # ---------------------------------------------------------------------
 
+# Canonical tri-codes -> NBA franchise team_id (matches nba_api / Eoin IDs)
+TEAM_CODE_TO_ID: Dict[str, int] = {
+    "ATL": 1610612737,
+    "BOS": 1610612738,
+    "BKN": 1610612751,
+    "CHA": 1610612766,
+    "CHI": 1610612741,
+    "CLE": 1610612739,
+    "DAL": 1610612742,
+    "DEN": 1610612743,
+    "DET": 1610612765,
+    "GSW": 1610612744,
+    "HOU": 1610612745,
+    "IND": 1610612754,
+    "LAC": 1610612746,
+    "LAL": 1610612747,
+    "MEM": 1610612763,
+    "MIA": 1610612748,
+    "MIL": 1610612749,
+    "MIN": 1610612750,
+    "NOP": 1610612740,
+    "NYK": 1610612752,
+    "OKC": 1610612760,
+    "ORL": 1610612753,
+    "PHI": 1610612755,
+    "PHX": 1610612756,
+    "POR": 1610612757,
+    "SAC": 1610612758,
+    "SAS": 1610612759,
+    "TOR": 1610612761,
+    "UTA": 1610612762,
+    "WAS": 1610612764,
+}
+
+# Common legacy/alternate abbreviations -> canonical tricode
 TEAM_CODE_ALIASES: Dict[str, str] = {
-    "NJN": "BRK",
+    # Brooklyn / New Jersey
+    "BRK": "BKN",
+    "BKN": "BKN",
+    "NJN": "BKN",
+    "BK": "BKN",
+
+    # New Orleans franchise
+    "NO": "NOP",
+    "NOP": "NOP",
     "NOH": "NOP",
     "NOK": "NOP",
-    "CHA": "CHO",
-    "CHH": "CHO",
-    "SEA": "OKC",
-    "VAN": "MEM",
+    "NOLA": "NOP",
+
+    # Golden State
+    "GS": "GSW",
+    "GSW": "GSW",
+
+    # San Antonio
+    "SA": "SAS",
+    "SAS": "SAS",
+
+    # New York
+    "NY": "NYK",
+    "NYK": "NYK",
+
+    # Washington
+    "WSH": "WAS",
+    "WAS": "WAS",
     "WSB": "WAS",
+
+    # Utah / Phoenix common alternates
+    "UTAH": "UTA",
+    "UTA": "UTA",
     "UTH": "UTA",
+    "PHO": "PHX",
+    "PHX": "PHX",
+
+    # Charlotte / OKC legacy
+    "CHA": "CHA",
+    "CHO": "CHA",
+    "CHH": "CHA",
+    "SEA": "OKC",
+    "OKC": "OKC",
+
+    # Memphis legacy
+    "VAN": "MEM",
+    "MEM": "MEM",
 }
 
 TEAM_NAME_TO_CODE: Dict[str, str] = {
     "ATLANTA HAWKS": "ATL",
     "BOSTON CELTICS": "BOS",
-    "BROOKLYN NETS": "BRK",
-    "NEW JERSEY NETS": "BRK",
-    "CHARLOTTE HORNETS": "CHO",
-    "CHARLOTTE BOBCATS": "CHO",
+    "BROOKLYN NETS": "BKN",
+    "NEW JERSEY NETS": "BKN",
+    "CHARLOTTE HORNETS": "CHA",
+    "CHARLOTTE BOBCATS": "CHA",
     "CHICAGO BULLS": "CHI",
     "CLEVELAND CAVALIERS": "CLE",
     "DALLAS MAVERICKS": "DAL",
@@ -68,6 +157,7 @@ TEAM_NAME_TO_CODE: Dict[str, str] = {
     "LOS ANGELES CLIPPERS": "LAC",
     "LA CLIPPERS": "LAC",
     "LOS ANGELES LAKERS": "LAL",
+    "LA LAKERS": "LAL",
     "MEMPHIS GRIZZLIES": "MEM",
     "MIAMI HEAT": "MIA",
     "MILWAUKEE BUCKS": "MIL",
@@ -78,6 +168,7 @@ TEAM_NAME_TO_CODE: Dict[str, str] = {
     "OKLAHOMA CITY THUNDER": "OKC",
     "ORLANDO MAGIC": "ORL",
     "PHILADELPHIA 76ERS": "PHI",
+    "PHILADELPHIA SIXERS": "PHI",
     "PHOENIX SUNS": "PHX",
     "PORTLAND TRAIL BLAZERS": "POR",
     "SACRAMENTO KINGS": "SAC",
@@ -88,25 +179,45 @@ TEAM_NAME_TO_CODE: Dict[str, str] = {
 }
 
 
-def normalize_team_code(code: str | float | int | None) -> str | None:
-    if code is None or pd.isna(code):
+def normalize_team_code(x: object) -> str | None:
+    """
+    Normalize a team token from the odds CSV into a canonical NBA tricode (e.g., SAS, GSW, NOP).
+
+    Handles:
+    - Abbrev-like tokens: "SA", "SAS", "GS", "GSW", "NO", "NOP", "UTAH", "WSH", etc.
+    - Full names: "LOS ANGELES LAKERS", "NEW JERSEY NETS", etc. (via TEAM_NAME_TO_CODE)
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return None
-    cleaned = str(code).strip().upper()
-    cleaned = TEAM_CODE_ALIASES.get(cleaned, cleaned)
-    return cleaned
+
+    s = str(x).strip().upper()
+
+    # Normalize punctuation/spaces
+    s = s.replace(".", " ").replace(",", " ").replace("_", " ").replace("-", " ")
+    s = " ".join(s.split())
+
+    # Abbreviation-like path (most odds datasets)
+    compact = s.replace(" ", "")
+    if 2 <= len(compact) <= 5 and compact.isalpha():
+        return TEAM_CODE_ALIASES.get(compact, compact)
+
+    # Full-name path
+    canon = TEAM_NAME_TO_CODE.get(s)
+    if canon:
+        return canon
+
+    return None
 
 
 # ---------------------------------------------------------------------
-# Helpers
+# Odds helpers
 # ---------------------------------------------------------------------
 
 
 def american_to_prob(odds_american: float | int | None) -> float:
     """Convert American odds to implied probability (pre-vig)."""
-
     if odds_american is None or pd.isna(odds_american):
         return np.nan
-
     o = float(odds_american)
     if o < 0:
         return (-o) / ((-o) + 100.0)
@@ -115,13 +226,10 @@ def american_to_prob(odds_american: float | int | None) -> float:
 
 def compute_home_away_spreads(row: pd.Series) -> tuple[float, float]:
     """From whos_favored + spread, compute spread_home / spread_away."""
-
     fav = row.get("whos_favored")
     s = row.get("spread")
-
     if pd.isna(s) or fav not in ("home", "away"):
         return np.nan, np.nan
-
     s = float(s)
     if fav == "home":
         return -s, s
@@ -135,63 +243,68 @@ def compute_home_away_spreads(row: pd.Series) -> tuple[float, float]:
 
 def load_raw_odds(raw_csv_path: Optional[Union[str, Path]] = None) -> pd.DataFrame:
     """Load the raw odds CSV from Kaggle."""
-
     raw_csv = Path(raw_csv_path) if raw_csv_path is not None else DEFAULT_ODDS_CSV
-
     if not raw_csv.exists():
         raise FileNotFoundError(
             f"NBA odds CSV not found at: {raw_csv}\n"
             "Either place the Kaggle file there, or pass raw_csv_path explicitly."
         )
-
-    df = pd.read_csv(raw_csv)
-    return df
+    return pd.read_csv(raw_csv)
 
 
 def normalize_odds(odds_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize the raw odds DataFrame into a tidy, QEPC-friendly table.
-    """
-
+    """Normalize raw odds into a QEPC-friendly tidy table."""
     odds = odds_raw.copy()
 
-    # 1) Normalize date + team codes
-    odds["game_date"] = pd.to_datetime(odds["date"]).dt.date
+    required = ["season", "date", "away", "home", "spread", "total", "moneyline_away", "moneyline_home"]
+    missing = [c for c in required if c not in odds.columns]
+    if missing:
+        raise ValueError(f"Odds CSV missing required columns {missing}. Found: {list(odds.columns)}")
+
+    # Dates: normalize to midnight (tz-naive). Odds "date" is already local-date style.
+    odds["game_date"] = pd.to_datetime(odds["date"], errors="coerce").dt.normalize()
+    if odds["game_date"].isna().all():
+        raise ValueError("Odds date parsing failed: all game_date values are NaT.")
+
+    # Team codes + IDs
     odds["home_code"] = odds["home"].apply(normalize_team_code)
     odds["away_code"] = odds["away"].apply(normalize_team_code)
 
-    # 2) Compute spreads from whos_favored + spread
-    home_spreads: list[float] = []
-    away_spreads: list[float] = []
+    odds["home_team_id"] = odds["home_code"].map(TEAM_CODE_TO_ID).astype("Int64")
+    odds["away_team_id"] = odds["away_code"].map(TEAM_CODE_TO_ID).astype("Int64")
 
-    for _, r in odds.iterrows():
-        h_s, a_s = compute_home_away_spreads(r)
-        home_spreads.append(h_s)
-        away_spreads.append(a_s)
-
-    odds["spread_home"] = home_spreads
-    odds["spread_away"] = away_spreads
-
-    # 3) Closing total
+    # Spreads + totals
+    spreads = odds.apply(compute_home_away_spreads, axis=1, result_type="expand")
+    odds["spread_home"] = spreads[0]
+    odds["spread_away"] = spreads[1]
     odds["total_points"] = odds["total"]
 
-    # 4) Moneyline → implied probabilities (pre-vig)
+    # Moneyline → implied probabilities (pre-vig), then vig-strip
     odds["p_home_raw"] = odds["moneyline_home"].apply(american_to_prob)
     odds["p_away_raw"] = odds["moneyline_away"].apply(american_to_prob)
 
-    sum_raw = odds["p_home_raw"] + odds["p_away_raw"]
-    sum_raw = sum_raw.replace({0: np.nan})
+    sum_raw = (odds["p_home_raw"] + odds["p_away_raw"]).replace({0: np.nan})
     odds["p_home"] = odds["p_home_raw"] / sum_raw
     odds["p_away"] = odds["p_away_raw"] / sum_raw
 
-    # 5) Game key (useful for diagnostics)
+    # Game key for diagnostics
     odds["game_key"] = (
-        odds["game_date"].astype(str)
+        odds["game_date"].dt.strftime("%Y-%m-%d")
         + "_"
-        + odds["away_code"].astype(str)
+        + odds["away_code"].fillna("UNK")
         + "_"
-        + odds["home_code"].astype(str)
+        + odds["home_code"].fillna("UNK")
     )
+
+    # Optional flags if present
+    if "regular" not in odds.columns:
+        odds["regular"] = np.nan
+    if "playoffs" not in odds.columns:
+        odds["playoffs"] = np.nan
+    if "score_away" not in odds.columns:
+        odds["score_away"] = np.nan
+    if "score_home" not in odds.columns:
+        odds["score_home"] = np.nan
 
     cols = [
         "season",
@@ -199,6 +312,8 @@ def normalize_odds(odds_raw: pd.DataFrame) -> pd.DataFrame:
         "game_key",
         "away_code",
         "home_code",
+        "away_team_id",
+        "home_team_id",
         "score_away",
         "score_home",
         "spread_home",
@@ -211,98 +326,22 @@ def normalize_odds(odds_raw: pd.DataFrame) -> pd.DataFrame:
         "regular",
         "playoffs",
     ]
-
-    missing = [c for c in cols if c not in odds.columns]
-    if missing:
-        raise ValueError(f"normalize_odds: missing expected columns: {missing}")
-
-    odds_tidy = odds[cols].copy()
-    return odds_tidy
+    return odds[cols].copy()
 
 
 def load_long_odds(raw_csv_path: Optional[Union[str, Path]] = None) -> pd.DataFrame:
     """Convenience function: load + normalize the long-horizon odds dataset."""
+    return normalize_odds(load_raw_odds(raw_csv_path=raw_csv_path))
 
-    odds_raw = load_raw_odds(raw_csv_path=raw_csv_path)
-    odds_tidy = normalize_odds(odds_raw)
-    return odds_tidy
+
+# Back-compat alias (useful because names drift between notebooks/scripts)
+def load_odds_long(raw_csv_path: Optional[Union[str, Path]] = None) -> pd.DataFrame:
+    return load_long_odds(raw_csv_path=raw_csv_path)
 
 
 # ---------------------------------------------------------------------
-# Mapping odds to games
+# Mapping odds to games + diagnostics
 # ---------------------------------------------------------------------
-
-
-def _detect_code_column(df: pd.DataFrame, prefix: str) -> str | None:
-    candidates = [
-        f"{prefix}_team_tricode",
-        f"{prefix}teamtricode",
-        f"{prefix}_team_abbrev",
-        f"{prefix}teamabbrev",
-        f"{prefix}_team_code",
-        f"{prefix}teamcode",
-    ]
-    for cand in candidates:
-        if cand in df.columns:
-            return cand
-    return None
-
-
-def _detect_name_column(df: pd.DataFrame, prefix: str) -> str | None:
-    candidates = [
-        f"{prefix}_team_name",
-        f"{prefix}teamname",
-        f"{prefix}_team",
-    ]
-    for cand in candidates:
-        if cand in df.columns:
-            return cand
-    return None
-
-
-def _normalize_game_codes(games_df: pd.DataFrame, prefix: str) -> pd.Series:
-    code_col = _detect_code_column(games_df, prefix)
-    name_col = _detect_name_column(games_df, prefix)
-
-    if code_col is not None:
-        return games_df[code_col].apply(normalize_team_code)
-
-    if name_col is not None:
-        return (
-            games_df[name_col]
-            .astype(str)
-            .str.upper()
-            .map(TEAM_NAME_TO_CODE)
-        )
-
-    return pd.Series([None] * len(games_df), index=games_df.index)
-
-
-def build_team_lookup_from_games(games_df: pd.DataFrame) -> pd.DataFrame:
-    """Build a mapping of team_code → team_id from games."""
-
-    frames = []
-    for prefix in ("home", "away"):
-        id_col = f"{prefix}_team_id"
-        if id_col not in games_df.columns:
-            continue
-        codes = _normalize_game_codes(games_df, prefix)
-        chunk = pd.DataFrame(
-            {
-                "team_id": games_df[id_col],
-                "team_code": codes,
-            }
-        )
-        frames.append(chunk)
-
-    if not frames:
-        return pd.DataFrame(columns=["team_id", "team_code"])
-
-    lookup = pd.concat(frames, ignore_index=True)
-    lookup = lookup.dropna(subset=["team_id", "team_code"])
-    lookup["team_code"] = lookup["team_code"].apply(normalize_team_code)
-    lookup = lookup.drop_duplicates(subset=["team_id", "team_code"])
-    return lookup
 
 
 @dataclass
@@ -313,63 +352,171 @@ class OddsDiagnostics:
     unmatched_games: int
     sample_unmatched_odds: pd.DataFrame
     sample_unmatched_games: pd.DataFrame
+    # Extra (nice-to-have) fields for debugging:
+    overlap_games: int
+    overlap_matched: int
+
+
+def _games_join_date_eastern_tznaive(games: pd.DataFrame) -> pd.Series:
+    """
+    Build the join date as Eastern-local calendar date (tz-naive, midnight).
+    This avoids the pandas merge error (tz-aware vs tz-naive) and matches odds conventions.
+    """
+    if "game_datetime" in games.columns:
+        dt = pd.to_datetime(games["game_datetime"], errors="coerce", utc=True)
+        return dt.dt.tz_convert("US/Eastern").dt.normalize().dt.tz_localize(None)
+    if "game_date" in games.columns:
+        return pd.to_datetime(games["game_date"], errors="coerce").dt.normalize()
+    raise ValueError("Games df missing game_datetime/game_date; cannot join odds.")
 
 
 def attach_odds_to_games(
     games_df: pd.DataFrame,
     odds_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, OddsDiagnostics]:
-    """Attach normalized odds to games with diagnostics."""
+    """
+    Attach normalized odds to games with diagnostics.
 
+    Join keys:
+        game_date_join (Eastern-local, tz-naive) + home_team_id + away_team_id
+
+    Also includes a small ±1 day rescue fill to catch lingering calendar/date edge cases.
+    """
     games = games_df.copy()
-    games["game_date"] = pd.to_datetime(games["game_date"]).dt.date
-
     odds = odds_df.copy()
-    odds["game_date"] = pd.to_datetime(odds["game_date"]).dt.date
-    odds["home_code"] = odds["home_code"].apply(normalize_team_code)
-    odds["away_code"] = odds["away_code"].apply(normalize_team_code)
 
-    lookup = build_team_lookup_from_games(games)
-    code_to_team_id = dict(zip(lookup["team_code"], lookup["team_id"]))
+    # --- Build join date keys ---
+    games["game_date_join"] = _games_join_date_eastern_tznaive(games)
+    odds["game_date_join"] = pd.to_datetime(odds["game_date"], errors="coerce").dt.normalize()
 
-    odds["home_team_id"] = odds["home_code"].map(code_to_team_id)
-    odds["away_team_id"] = odds["away_code"].map(code_to_team_id)
+    # Align ID dtypes
+    for c in ("home_team_id", "away_team_id"):
+        if c not in games.columns:
+            raise ValueError(f"Games df missing required column: {c}")
+        games[c] = pd.to_numeric(games[c], errors="coerce").astype("Int64")
+        odds[c] = pd.to_numeric(odds[c], errors="coerce").astype("Int64")
 
+    key_cols = ["game_date_join", "home_team_id", "away_team_id"]
+
+    # Deduplicate odds on join keys (keep last row)
+    if odds.duplicated(subset=key_cols).any():
+        odds = odds.sort_values(key_cols).drop_duplicates(subset=key_cols, keep="last")
+
+    # Primary merge: keep odds game_date separately for clarity
+    odds_for_merge = odds.rename(columns={"game_date": "odds_game_date"})
     merged = games.merge(
-        odds,
-        on=["game_date", "home_team_id", "away_team_id"],
+        odds_for_merge,
+        on=key_cols,
         how="left",
         suffixes=("", "_odds"),
     )
 
-    matched_rows = merged[~merged["game_key"].isna()].shape[0]
-    unmatched_odds = odds[odds[["home_team_id", "away_team_id"]].isna().any(axis=1)].shape[0]
-    unmatched_games = merged[merged["game_key"].isna()].shape[0]
+    odds_fields = [c for c in ["total_points", "spread_home", "moneyline_home", "moneyline_away", "p_home", "p_away"] if c in merged.columns]
+    matched_mask = merged[odds_fields].notna().any(axis=1) if odds_fields else pd.Series(False, index=merged.index)
+
+    # --- Rescue pass: try ±1 day for rows that missed ---
+    if (~matched_mask).any():
+        missing_idx = merged.index[~matched_mask]
+
+        # Build fast lookup table for odds fields only (prevents column chaos)
+        odds_lookup = odds_for_merge.set_index(key_cols)
+
+        def pull_shift(days: int) -> pd.DataFrame:
+            tmp_keys = merged.loc[missing_idx, key_cols].copy()
+            tmp_keys["game_date_join"] = tmp_keys["game_date_join"] + pd.Timedelta(days=days)
+            pulled = odds_lookup.reindex(list(zip(tmp_keys["game_date_join"], tmp_keys["home_team_id"], tmp_keys["away_team_id"])))
+            pulled.index = missing_idx
+            return pulled
+
+        pulled_plus = pull_shift(+1)
+        pulled_minus = pull_shift(-1)
+
+        # Fill only when the target field is missing
+        for col in odds_for_merge.columns:
+            if col in key_cols:
+                continue
+            if col not in merged.columns:
+                merged[col] = np.nan
+
+            base = merged.loc[missing_idx, col]
+            merged.loc[missing_idx, col] = base.where(base.notna(), pulled_plus[col])
+            base2 = merged.loc[missing_idx, col]
+            merged.loc[missing_idx, col] = base2.where(base2.notna(), pulled_minus[col])
+
+        # Recompute match mask after rescue
+        matched_mask = merged[odds_fields].notna().any(axis=1) if odds_fields else pd.Series(False, index=merged.index)
+
+    matched_rows = int(matched_mask.sum())
+    unmatched_games = int((~matched_mask).sum())
+
+    # Unmatched odds: keys not found in games keys
+    game_keys = set(
+        zip(
+            games["game_date_join"].astype("datetime64[ns]").tolist(),
+            games["home_team_id"].tolist(),
+            games["away_team_id"].tolist(),
+        )
+    )
+    odds_keys = list(
+        zip(
+            odds["game_date_join"].astype("datetime64[ns]").tolist(),
+            odds["home_team_id"].tolist(),
+            odds["away_team_id"].tolist(),
+        )
+    )
+    odds_not_in_games_mask = pd.Series([k not in game_keys for k in odds_keys], index=odds.index)
+    unmatched_odds_df = odds.loc[odds_not_in_games_mask].copy()
+
+    # Overlap-focused metrics (more “honest” than counting 1946 games with no odds file)
+    odds_min = odds["game_date_join"].min()
+    odds_max = odds["game_date_join"].max()
+    in_overlap = games["game_date_join"].between(odds_min, odds_max, inclusive="both")
+    overlap_games = int(in_overlap.sum())
+    overlap_matched = int((matched_mask & in_overlap).sum())
 
     diag = OddsDiagnostics(
         matched_rows=matched_rows,
-        total_games=len(games),
-        unmatched_odds=unmatched_odds,
+        total_games=int(len(games)),
+        unmatched_odds=int(len(unmatched_odds_df)),
         unmatched_games=unmatched_games,
-        sample_unmatched_odds=odds[odds[["home_team_id", "away_team_id"]].isna()].head(5),
-        sample_unmatched_games=merged[merged["game_key"].isna()].head(5),
+        sample_unmatched_odds=unmatched_odds_df.head(5),
+        sample_unmatched_games=merged.loc[~matched_mask].head(5),
+        overlap_games=overlap_games,
+        overlap_matched=overlap_matched,
     )
 
     return merged, diag
 
 
-# ---------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------
+__all__ = [
+    "PROJECT_ROOT",
+    "DEFAULT_ODDS_CSV",
+    "TEAM_CODE_TO_ID",
+    "TEAM_CODE_ALIASES",
+    "TEAM_NAME_TO_CODE",
+    "normalize_team_code",
+    "load_raw_odds",
+    "normalize_odds",
+    "load_long_odds",
+    "load_odds_long",
+    "attach_odds_to_games",
+    "OddsDiagnostics",
+]
 
 
 if __name__ == "__main__":
     print("PROJECT_ROOT:", PROJECT_ROOT)
     print("DEFAULT_ODDS_CSV:", DEFAULT_ODDS_CSV)
+    o = load_long_odds()
+    print("Loaded odds:", o.shape)
+    print(o.head())
 
-    try:
-        df = load_long_odds()
-        print("Loaded odds_tidy:", df.shape)
-        print(df.head())
-    except FileNotFoundError as exc:
-        print(exc)
+    # Optional quick merge smoke check if games parquet exists in your pipeline
+    games_path = PROJECT_ROOT / "cache" / "imports" / "eoin_games_qepc.parquet"
+    if games_path.exists():
+        g = pd.read_parquet(games_path)
+        merged, d = attach_odds_to_games(g, o)
+        print(f"Matched {d.matched_rows} of {d.total_games} games.")
+        print(f"Overlap matched {d.overlap_matched} of {d.overlap_games} games in odds date range.")
+        print("Unmatched odds sample:")
+        print(d.sample_unmatched_odds.head())
