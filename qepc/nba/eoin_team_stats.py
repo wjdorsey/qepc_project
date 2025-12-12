@@ -29,12 +29,27 @@ from typing import Optional
 
 import pandas as pd
 
-from .eoin_data_source import load_eoin_team_boxes, get_project_root
+from qepc.utils.paths import get_project_root
+
+from .eoin_data_source import load_eoin_team_boxes
+from .schema import validate_team_boxes
+
+
+def _ensure_game_date(df: pd.DataFrame) -> pd.DataFrame:
+    if "game_date" in df.columns:
+        return df.copy()
+    if "game_datetime" in df.columns:
+        df = df.copy()
+        df["game_date"] = pd.to_datetime(df["game_datetime"]).dt.date
+        return df
+    raise ValueError("team_boxes is missing both 'game_date' and 'game_datetime'.")
 
 
 def build_team_stats_from_eoin(
     team_boxes: Optional[pd.DataFrame] = None,
     project_root: Optional[Path] = None,
+    start_date: Optional[pd.Timestamp] = None,
+    cutoff_date: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     """
     Aggregate Eoin team_boxes_qepc into a per-team stats table.
@@ -65,7 +80,16 @@ def build_team_stats_from_eoin(
     if team_boxes is None:
         team_boxes = load_eoin_team_boxes(project_root)
 
-    df = team_boxes.copy()
+    df = validate_team_boxes(team_boxes.copy())
+    df = _ensure_game_date(df)
+
+    if start_date is not None:
+        start = pd.to_datetime(start_date).date()
+        df = df[df["game_date"] >= start]
+
+    if cutoff_date is not None:
+        end = pd.to_datetime(cutoff_date).date()
+        df = df[df["game_date"] < end]
 
     # Required columns we expect from your normalized team_boxes_qepc
     required_cols = [

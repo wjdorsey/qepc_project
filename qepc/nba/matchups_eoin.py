@@ -119,13 +119,17 @@ def _build_rest_index(games: pd.DataFrame) -> pd.DataFrame:
 def _build_modern_strengths(
     team_boxes: pd.DataFrame,
     modern_cutoff: dt.date = dt.date(2022, 10, 1),
+    cutoff_date: dt.date | None = None,
 ) -> pd.DataFrame:
     """
     Build team strengths using only games on/after modern_cutoff.
     Returns strengths DataFrame indexed by team_id (via caller).
     """
     team_boxes = _ensure_game_date(team_boxes)
+
     modern = team_boxes[team_boxes["game_date"] >= modern_cutoff].copy()
+    if cutoff_date is not None:
+        modern = modern[modern["game_date"] < cutoff_date]
 
     if modern.empty:
         raise ValueError(
@@ -134,7 +138,12 @@ def _build_modern_strengths(
         )
 
     team_stats_modern = build_team_stats_from_eoin(modern)
-    strengths_modern = calculate_advanced_strengths_from_eoin(team_stats_modern)
+    strengths_modern = calculate_advanced_strengths_from_eoin(
+        team_stats_modern,
+        start_date=modern_cutoff,
+        cutoff_date=cutoff_date,
+        verbose=False,
+    )
     return strengths_modern
 
 
@@ -190,6 +199,19 @@ def _predict_team_points_with_schedule(
     return home_raw, away_raw
 
 
+def _extract_actual_score(game_row: pd.Series, prefix: str) -> float | None:
+    candidates = [
+        f"{prefix}_score",
+        f"{prefix}score",
+        f"{prefix}_points",
+        f"{prefix}points",
+    ]
+    for cand in candidates:
+        if cand in game_row.index:
+            return game_row[cand]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -197,6 +219,7 @@ def _predict_team_points_with_schedule(
 def build_matchups_for_date(
     target_date: DateLike,
     modern_cutoff: dt.date = dt.date(2022, 10, 1),
+    cutoff_date: dt.date | None = None,
     home_bonus: float = 1.5,
     away_penalty: float = 0.5,
     b2b_penalty: float = 1.5,
@@ -240,6 +263,8 @@ def build_matchups_for_date(
         - exp_home_pts, exp_away_pts
     """
     date_obj = _parse_date(target_date)
+    if cutoff_date is None:
+        cutoff_date = date_obj
 
     # Load base data
     games = load_eoin_games()
@@ -273,13 +298,18 @@ def build_matchups_for_date(
             ]
         )
 
-    # Build strengths from modern window
+    # Build strengths from modern window using only *prior* games
     team_boxes = load_eoin_team_boxes()
-    strengths_modern = _build_modern_strengths(team_boxes, modern_cutoff=modern_cutoff)
+    strengths_modern = _build_modern_strengths(
+        team_boxes,
+        modern_cutoff=modern_cutoff,
+        cutoff_date=cutoff_date,
+    )
     strengths_idx = strengths_modern.set_index("team_id")
 
-    # Rest / B2B index from all games
-    rest_idx = _build_rest_index(games)
+    # Rest / B2B index from games up to and including the target date
+    rest_source = games[games["game_date"] <= date_obj].copy()
+    rest_idx = _build_rest_index(rest_source)
 
     rows = []
     for _, g in day_games.iterrows():
@@ -330,6 +360,10 @@ def build_matchups_for_date(
         # Use whatever name fields exist in games
         row_out["home_team_name"] = g.get("home_team_name", g.get("hometeamname", None))
         row_out["away_team_name"] = g.get("away_team_name", g.get("awayteamname", None))
+
+        # Actual scores if present (useful for leakage-free backtests)
+        row_out["actual_home_pts"] = _extract_actual_score(g, "home")
+        row_out["actual_away_pts"] = _extract_actual_score(g, "away")
 
         # Strength-level info
         row_out["home_strength_score"] = home_team.get("strength_score", np.nan)

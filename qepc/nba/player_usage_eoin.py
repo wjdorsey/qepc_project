@@ -21,10 +21,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .eoin_data_source import (
-    load_eoin_player_boxes,
-    get_project_root,
-)
+from qepc.utils.paths import get_project_root
+
+from .eoin_data_source import load_eoin_player_boxes
 
 
 # ---------------------------------------------------------------------------
