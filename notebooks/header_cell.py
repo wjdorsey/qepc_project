@@ -1,35 +1,21 @@
-# =========================
-# CELL 1 – QEPC PATH SETUP
-# =========================
-
-import sys
 from pathlib import Path
-import pandas as pd  # still fine to keep this here
+import sys
 
-# Try to auto-detect the project root by walking up from the current directory
-NOTEBOOK_DIR = Path.cwd()
+# 1) Find repo root (the folder that contains qepc/__init__.py)
+PROJECT_ROOT = next(
+    p for p in [Path.cwd().resolve()] + list(Path.cwd().resolve().parents)
+    if (p / "qepc" / "__init__.py").exists()
+)
 
-PROJECT_ROOT = None
-for parent in [NOTEBOOK_DIR] + list(NOTEBOOK_DIR.parents):
-    # We treat any directory that contains a "qepc" folder as the project root
-    if (parent / "qepc").is_dir():
-        PROJECT_ROOT = parent
-        break
-
-# Fallback: if auto-detect fails, use the old hard-coded path
-if PROJECT_ROOT is None:
-    PROJECT_ROOT = Path(r"C:\Users\wdors\qepc_project").resolve()
-
-# Make sure the project root is on sys.path so `import qepc...` works
+# 2) Make qepc importable
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-print("NOTEBOOK_DIR:", NOTEBOOK_DIR)
+# 3) Now this works
+from qepc.notebook_bootstrap import ensure_project_root
+PROJECT_ROOT = ensure_project_root()
+
+from qepc.utils.paths import get_project_root
+PROJECT_ROOT = get_project_root(PROJECT_ROOT)
+
 print("PROJECT_ROOT:", PROJECT_ROOT)
-print("qepc package exists here?:", (PROJECT_ROOT / "qepc").is_dir())
-
-DATA_DIR = PROJECT_ROOT / "data"
-CACHE_DIR = PROJECT_ROOT / "cache"
-
-print("DATA_DIR:", DATA_DIR)
-print("CACHE_DIR:", CACHE_DIR)
