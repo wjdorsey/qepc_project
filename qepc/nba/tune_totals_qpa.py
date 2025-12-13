@@ -1,4 +1,10 @@
-"""Tune quantum-inspired totals parameters via walk-forward search."""
+"""Tune quantum-inspired totals parameters via walk-forward search.
+
+This module is intended to be run locally (where your parquet/CSV caches exist).
+It does *not* hardcode machine-specific paths; it resolves PROJECT_ROOT via
+qepc.utils.paths.get_project_root().
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -23,10 +29,28 @@ from qepc.nba.qpa_totals import (
 from qepc.utils.paths import get_project_root
 
 
+def _normalized_game_date(df: pd.DataFrame) -> pd.Series:
+    """Return a timezone-safe, normalized date Series for sorting/filtering.
+
+    Prefers df['game_date'] if present, otherwise df['game_datetime'].
+    Output is tz-naive midnight timestamps (datetime64[ns]) suitable for joins/sorts.
+    """
+    if "game_date" in df.columns:
+        s = df["game_date"]
+    elif "game_datetime" in df.columns:
+        s = df["game_datetime"]
+    else:
+        raise KeyError("Expected 'game_date' or 'game_datetime' in DataFrame.")
+
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+    dt = dt.dt.tz_convert(None).dt.normalize()
+    return dt
+
+
 def _build_walkforward_indices(df: pd.DataFrame, folds: int) -> List[Tuple[int, int]]:
     n = len(df)
     fold_size = max(n // folds, 1)
-    indices = []
+    indices: List[Tuple[int, int]] = []
     for i in range(folds):
         start = i * fold_size
         end = n if i == folds - 1 else min((i + 1) * fold_size, n)
@@ -41,10 +65,18 @@ def _score_config(
     folds: int,
     seed: int,
 ) -> Tuple[float, List[Dict[str, float]]]:
-    team_state, enriched = enrich_games_with_config(games, team_boxes, config)
-    enriched = enriched.sort_values(
-        pd.to_datetime(enriched.get("game_date", enriched.get("game_datetime")))
-    ).reset_index(drop=True)
+    # Build features (should be leakage-safe inside enrich/predict implementations)
+    _team_state, enriched = enrich_games_with_config(games, team_boxes, config)
+
+    # pandas.sort_values needs a column name, not a Series.
+    sort_dt = _normalized_game_date(enriched)
+    enriched = (
+        enriched.assign(_sort_date=sort_dt)
+        .sort_values("_sort_date")
+        .drop(columns=["_sort_date"])
+        .reset_index(drop=True)
+    )
+
     indices = _build_walkforward_indices(enriched, folds)
 
     fold_metrics: List[Dict[str, float]] = []
@@ -53,14 +85,21 @@ def _score_config(
     for fold_idx, (start, end) in enumerate(indices):
         val_df = enriched.iloc[start:end]
         train_df = enriched.iloc[:start]
+
         if train_df.empty:
             continue
+
         corr_stats = estimate_score_correlation(train_df, config.corr_shrink)
         rng = np.random.default_rng(seed + fold_idx)
+
         preds = predict_totals(val_df, config, corr_stats, rng)
         metrics = evaluate_predictions(preds)
+
+        metrics = dict(metrics)
+        metrics["fold"] = fold_idx + 1
         fold_metrics.append(metrics)
-        score = metrics["mae"] + 0.25 * abs(metrics["bias"])
+
+        score = float(metrics["mae"]) + 0.25 * abs(float(metrics["bias"]))
         scores.append(score)
 
     overall = float(np.mean(scores)) if scores else float("inf")
@@ -110,16 +149,17 @@ def tune(
     seed: int,
 ) -> Tuple[TotalsConfig, List[Dict[str, float]]]:
     rng = np.random.default_rng(seed)
+
     best_config = TotalsConfig()
     best_score, _ = _score_config(games, team_boxes, best_config, folds, seed)
 
     for i in range(iterations):
         temperature = max(0.1, 1.0 - i / max(iterations - 1, 1))
-        if i % 3 == 0:
-            candidate = _random_config(rng)
-        else:
-            candidate = _jitter_config(best_config, rng, temperature)
+
+        candidate = _random_config(rng) if i % 3 == 0 else _jitter_config(best_config, rng, temperature)
+
         score, _ = _score_config(games, team_boxes, candidate, folds, seed)
+
         if score < best_score:
             best_score = score
             best_config = candidate
@@ -128,7 +168,8 @@ def tune(
             if rng.uniform() < accept_prob:
                 best_score = score
                 best_config = candidate
-    final_score, fold_metrics = _score_config(games, team_boxes, best_config, folds, seed)
+
+    _final_score, fold_metrics = _score_config(games, team_boxes, best_config, folds, seed)
     return best_config, fold_metrics
 
 
@@ -151,28 +192,23 @@ def main(argv: Optional[list[str]] = None) -> None:
     team_boxes = load_eoin_team_boxes(project_root)
 
     if args.start is not None:
-        games = games.loc[
-            pd.to_datetime(games.get("game_date", games.get("game_datetime")))
-            >= pd.to_datetime(args.start)
-        ]
-        team_boxes = team_boxes.loc[
-            pd.to_datetime(team_boxes.get("game_date", team_boxes.get("game_datetime")))
-            >= pd.to_datetime(args.start)
-        ]
+        start_dt = pd.Timestamp(args.start).normalize()
+        gdt = _normalized_game_date(games)
+        tdt = _normalized_game_date(team_boxes)
+        games = games.loc[gdt >= start_dt]
+        team_boxes = team_boxes.loc[tdt >= start_dt]
+
     if args.end is not None:
-        games = games.loc[
-            pd.to_datetime(games.get("game_date", games.get("game_datetime")))
-            <= pd.to_datetime(args.end)
-        ]
-        team_boxes = team_boxes.loc[
-            pd.to_datetime(team_boxes.get("game_date", team_boxes.get("game_datetime")))
-            <= pd.to_datetime(args.end)
-        ]
+        end_dt = pd.Timestamp(args.end).normalize()
+        gdt = _normalized_game_date(games)
+        tdt = _normalized_game_date(team_boxes)
+        games = games.loc[gdt <= end_dt]
+        team_boxes = team_boxes.loc[tdt <= end_dt]
 
     if args.with_odds:
         odds_path = project_root / "data" / "raw" / "nba" / "odds_long" / "nba_2008-2025.csv"
         odds_df = load_long_odds(odds_path)
-        games, _ = attach_odds_to_games(games, odds_df)
+        games, _diag = attach_odds_to_games(games, odds_df)
 
     best_config, fold_metrics = tune(
         games=games,
@@ -182,8 +218,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         seed=args.seed,
     )
 
-    for idx, metrics in enumerate(fold_metrics):
-        print(f"Fold {idx+1}: MAE={metrics['mae']:.3f} bias={metrics['bias']:.3f}")
+    for m in fold_metrics:
+        print(f"Fold {m.get('fold','?')}: MAE={m['mae']:.3f} bias={m['bias']:.3f}")
 
     print("Best config:")
     print(json.dumps(best_config.to_dict(), indent=2))
