@@ -24,7 +24,11 @@ from qepc.utils.paths import get_project_root
 from qepc.nba.odds_long_loader import load_long_odds, attach_odds_to_games
 
 
-PROJECT_ROOT: Path = get_project_root(Path(__file__).resolve())
+def get_default_project_root() -> Path:
+    return get_project_root(Path(__file__).resolve())
+
+
+PROJECT_ROOT: Path = get_default_project_root()
 
 GAMES_PARQUET_DEFAULT = PROJECT_ROOT / "cache" / "imports" / "eoin_games_qepc.parquet"
 ODDS_CSV_DEFAULT = PROJECT_ROOT / "data" / "raw" / "nba" / "odds_long" / "nba_2008-2025.csv"
