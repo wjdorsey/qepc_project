@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -21,7 +21,6 @@ def collapse_total_with_odds(
     alpha: float = 0.02,
 ) -> pd.Series:
     """Blend QEPC and Vegas totals using rolling EMA of errors (shifted)."""
-
     working = df.copy()
     for col in (qepc_col, vegas_col, actual_col):
         if col not in working.columns:
@@ -35,7 +34,7 @@ def collapse_total_with_odds(
     ema_v = working["err_vegas"].ewm(alpha=alpha, adjust=False).mean().shift(1)
 
     denom = ema_q + ema_v
-    weight_vegas = ema_q / denom
+    weight_vegas = (ema_q / denom).replace([np.inf, -np.inf], np.nan)
     weight_vegas = weight_vegas.fillna(0.5).clip(0, 1)
 
     collapsed = weight_vegas * working[vegas_col] + (1 - weight_vegas) * working[qepc_col]
@@ -48,20 +47,34 @@ def _heuristic_script_probs(
     window: int = 20,
     scripts: Sequence[str] = DEFAULT_SCRIPTS,
 ) -> pd.DataFrame:
+    """Leakage-safe heuristic script probabilities from past totals behavior."""
+    scripts_list = list(scripts)
+
     rolling_std = totals.rolling(window=window, min_periods=5).std().shift(1)
     rolling_mean = totals.rolling(window=window, min_periods=5).mean().shift(1)
 
-    # map std to chaos probability via logistic
     chaos_p = 1 / (1 + np.exp(-(rolling_std - 8) / 2))
-    grind_p = 1 / (1 + np.exp((rolling_mean - totals.median()) / 5))
-    chaos_p = chaos_p.fillna(0.33)
-    grind_p = grind_p.fillna(0.33)
+    median_total = float(totals.median())
+    grind_p = 1 / (1 + np.exp((rolling_mean - median_total) / 5))
+
+    chaos_p = chaos_p.fillna(1 / 3)
+    grind_p = grind_p.fillna(1 / 3)
+
     balanced_p = 1 - (chaos_p + grind_p)
     balanced_p = balanced_p.clip(lower=0)
 
-    probs = pd.DataFrame({"CHAOS": chaos_p, "GRIND": grind_p, "BALANCED": balanced_p})
-    probs = probs[scripts]
-    probs = probs.div(probs.sum(axis=1), axis=0).fillna(1 / len(scripts))
+    probs = pd.DataFrame({"GRIND": grind_p, "BALANCED": balanced_p, "CHAOS": chaos_p})
+    probs = probs.reindex(columns=scripts_list, fill_value=0.0)
+
+    row_sum = probs.sum(axis=1)
+    mask = (row_sum <= 0) | (~row_sum.notna())
+    if "BALANCED" in probs.columns:
+        probs.loc[mask, :] = 0.0
+        probs.loc[mask, "BALANCED"] = 1.0
+    else:
+        probs.loc[mask, :] = 1.0 / max(len(probs.columns), 1)
+
+    probs = probs.div(probs.sum(axis=1), axis=0).fillna(1.0 / max(len(probs.columns), 1))
     probs.columns = [f"p_{c.lower()}" for c in probs.columns]
     return probs
 
@@ -73,6 +86,7 @@ def apply_script_superposition(
     deltas: Optional[Sequence[float]] = None,
     window: int = 20,
 ) -> pd.Series:
+    """Mixture-of-scripts totals: Σ p(script) * (base_total + delta_script)."""
     if deltas is None:
         deltas = (-6.0, 0.0, 6.0)
     if len(deltas) != len(scripts):
@@ -86,8 +100,7 @@ def apply_script_superposition(
     for script in scripts:
         p_col = f"p_{script.lower()}"
         adj = adjustments[script]
-        comp = probs[p_col].fillna(0) * (totals + adj)
-        components.append(comp)
+        components.append(probs[p_col].fillna(0) * (totals + adj))
 
     mixture = sum(components)
     mixture.name = "total_mix"
@@ -111,6 +124,7 @@ def overdispersed_total_distribution(
     alpha: float = 0.05,
     window: int = 60,
 ) -> DistributionStats:
+    """Overdispersed (NB-ish) variance estimate + entropy tracking (leakage-safe)."""
     working = df.sort_values("game_date").copy()
     if pred_col not in working.columns:
         raise KeyError(f"{pred_col} missing from DataFrame")
@@ -120,27 +134,30 @@ def overdispersed_total_distribution(
     working["resid"] = working[actual_col] - working[pred_col]
     rolling_var = (working["resid"] ** 2).rolling(window=window, min_periods=10).mean().shift(1)
 
-    mu = working[pred_col]
+    mu = working[pred_col].astype(float)
     alpha_param = ((rolling_var - mu).clip(lower=0)) / (mu ** 2 + 1e-9)
     alpha_param = alpha_param.fillna(alpha_param.median()).clip(lower=0)
 
     variance = mu + alpha_param * (mu ** 2)
-    std = np.sqrt(variance)
+    std = np.sqrt(variance.clip(lower=1e-9))
 
-    z = 1.96  # ~95%
+    z = 1.96
     lower = mu - z * std
     upper = mu + z * std
 
+    rng = np.random.default_rng(0)
     entropy_vals = []
-    for m, v in zip(mu, variance):
-        sigma = np.sqrt(max(v, 1e-6))
-        samples = np.random.normal(loc=m, scale=sigma, size=2000)
+    for m, v in zip(mu.to_numpy(), variance.to_numpy()):
+        sigma = float(np.sqrt(max(float(v), 1e-6)))
+        samples = rng.normal(loc=float(m), scale=sigma, size=2000)
         samples = np.clip(np.round(samples), 0, None).astype(int)
-        counts = np.histogram(samples, bins=range(int(samples.min()), int(samples.max()) + 2))[0]
-        probs = counts / counts.sum()
-        entropy_vals.append(discrete_entropy(probs, base=2))
+        lo = int(samples.min())
+        hi = int(samples.max())
+        counts = np.histogram(samples, bins=range(lo, hi + 2))[0]
+        p = counts / counts.sum() if counts.sum() else np.array([1.0])
+        entropy_vals.append(discrete_entropy(p, base=2))
 
-    stats = DistributionStats(
+    return DistributionStats(
         mean=mu,
         variance=variance,
         overdispersion=alpha_param,
@@ -148,4 +165,3 @@ def overdispersed_total_distribution(
         upper_pi=upper,
         entropy_bits=pd.Series(entropy_vals, index=working.index),
     )
-    return stats
