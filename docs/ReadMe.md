@@ -161,7 +161,20 @@ qepc/
 
 ---
 
-## 🧩 11. References and Further Reading
+## 🌀 11. QPA Totals Stack (NBA)
+
+The NBA totals pipeline now layers several quantum-inspired adjustments on top of the base expected-points model:
+
+- **League Field (environment drift):** walk-forward blend of fast/slow residual means (shifted) to track scoring meta shifts.
+- **Script Superposition:** GRIND/BALANCED/CHAOS mixture adjusts totals by the expected script probability (leakage-safe heuristics).
+- **Market Entanglement Collapse:** posterior blend between QEPC and Vegas totals using shifted EMAs of recent absolute error.
+- **Overdispersed Distribution + Entropy:** rolling variance → negative-binomial style dispersion; entropy logged for uncertainty.
+
+These layers are accessible via `qepc.nba.backtest_totals` and notebook helpers, and remain leakage-safe by shifting/rolling rules.
+
+---
+
+## 🧩 12. References and Further Reading
 
 * Schuld, M. & Petruccione, F. (2018). *Supervised Learning with Quantum Computers.* Springer.
 * Havlíček, V. et al. (2019). *Supervised learning with quantum-enhanced feature spaces.* Nature.
@@ -171,7 +184,7 @@ qepc/
 
 ---
 
-## 🧭 12. Closing Thought
+## 🧭 13. Closing Thought
 
 > QEPC’s “quantum” is not about hardware qubits — it’s about embracing **probability as a first-class citizen**.
 > Every pass, every shot, every substitution is a superposition that collapses only when the game ends.

@@ -45,10 +45,17 @@ from qepc.utils.paths import get_project_root
 # Project root detection
 # ---------------------------------------------------------------------
 
-PROJECT_ROOT: Path = get_project_root(Path(__file__).resolve())
-DEFAULT_ODDS_CSV: Path = (
-    PROJECT_ROOT / "data" / "raw" / "nba" / "odds_long" / "nba_2008-2025.csv"
-)
+def get_default_project_root() -> Path:
+    return get_project_root(Path(__file__).resolve())
+
+
+def get_default_odds_csv(project_root: Optional[Path] = None) -> Path:
+    root = project_root or get_default_project_root()
+    return root / "data" / "raw" / "nba" / "odds_long" / "nba_2008-2025.csv"
+
+
+PROJECT_ROOT: Path = get_default_project_root()
+DEFAULT_ODDS_CSV: Path = get_default_odds_csv()
 
 # ---------------------------------------------------------------------
 # Team normalization

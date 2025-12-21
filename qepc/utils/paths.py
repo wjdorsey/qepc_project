@@ -82,7 +82,39 @@ def get_project_root(start: Optional[Path | str] = None) -> Path:
     return Path.cwd()
 
 
-PROJECT_ROOT: Path = get_project_root()
+class ProjectRootLocator:
+    """Late-binding proxy that keeps project root resolution resilient.
+
+    Some environments import modules from notebooks or scripts executed from
+    outside the repository.  Freezing a global ``PROJECT_ROOT`` at import time
+    can therefore lock in an incorrect path.  The locator recomputes the root
+    on demand (and can be refreshed) while still behaving like a ``Path`` for
+    convenience.
+    """
+
+    def __init__(self) -> None:
+        self._cached: Optional[Path] = None
+
+    def path(self, start: Optional[Path | str] = None, refresh: bool = False) -> Path:
+        if refresh or self._cached is None:
+            self._cached = get_project_root(start)
+        return self._cached
+
+    def __call__(self, start: Optional[Path | str] = None, refresh: bool = False) -> Path:
+        return self.path(start=start, refresh=refresh)
+
+    def joinpath(self, *other: Iterable[str | Path]) -> Path:
+        return self.path().joinpath(*other)
+
+    def __truediv__(self, other: str | Path) -> Path:
+        return self.path().__truediv__(other)
+
+    def __fspath__(self) -> str:  # type: ignore[override]
+        return str(self.path())
+
+
+# Expose a late-binding project root proxy for convenience.
+PROJECT_ROOT = ProjectRootLocator()
 
 
 def ensure_relative_to_root(*parts: Iterable[str | Path]) -> Path:
