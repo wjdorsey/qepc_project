@@ -1,36 +1,26 @@
 """Player points projection utilities with quantum-inspired twists.
 
-This module focuses on **points** but is intentionally structured so rebounds
-and assists can be layered in later. It aims to be:
+This module projects NBA player **points** from Eoin boxscores in a way that is:
 
-- **Leakage-safe**: all rolling features use shift(1) before rolling/expanding.
-- **Portable**: all disk access resolves from QEPC auto-detected PROJECT_ROOT.
-- **Robust**: hardened dtype joins + NaN-safe weighted statistics.
+- **Leakage-safe**: all rolling/recency features use only prior games (shift(1)).
+- **Portable**: all data paths resolve via QEPC PROJECT_ROOT auto-detect.
+- **Robust**: dtype-hardened joins + NaN-safe weighted statistics.
 
-Key ideas
----------
-- "Coherent minutes" are modeled as *expected minutes* from prior games
-  (rolling mean of shifted minutes), not the current game's boxscore minutes.
-  This prevents a classic leakage trap.
-- Decoherence-weighted recency is used for usage and efficiency priors.
-- Optional entanglement variance boost from correlation with team scoring context.
+Key idea (minutes coherence)
+----------------------------
+We treat minutes as a *latent/expected* quantity ("coherent minutes") derived
+from **prior** games, not the current game's boxscore. This prevents leakage.
 
-Schema (per-game rows)
-----------------------
-Returned DataFrames contain at least:
-- ``game_id``
-- ``player_id``
-- ``team_name``
-- ``game_date`` (datetime64[ns])
-- ``actual_points``
-- ``predicted_points`` (mean)
-- ``predicted_variance``
+Improvements in this version
+----------------------------
+- Minutes artifact clipping (Eoin has min=-5 and max=96 in `numminutes`)
+- Nonlinear minutes scaling so bench players aren't over-credited and high-
+  minutes players aren't artificially capped.
 
-Plus diagnostics:
-- ``cum_games`` (number of PRIOR games for that player)
-- ``minutes_actual`` (from boxscore; used only for filtering/diagnostics)
-- ``minutes_expected`` / ``minutes_coherent`` (leakage-safe minutes feature)
-- ``season_mean_pts`` / ``recency_mean_pts`` / ``efficiency_coherent`` etc.
+Returned DataFrame contains at least:
+- game_id, player_id, team_id, team_name, game_date
+- actual_points, predicted_points, predicted_variance
+- cum_games, minutes_actual, minutes_expected, minutes_coherent
 """
 
 from __future__ import annotations
@@ -46,13 +36,13 @@ from .eoin_data_source import load_eoin_player_boxes, load_eoin_team_boxes
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses for configuration (extensible to rebounds/assists later)
+# Dataclasses for configuration
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class DecoherenceConfig:
-    """Time constants (in days) for recency decay of player features."""
+    """Time constants (days) for exponential recency decay of priors."""
     minutes_tau: float = 18.0
     usage_tau: float = 16.0
     efficiency_tau: float = 20.0
@@ -61,7 +51,7 @@ class DecoherenceConfig:
 
 @dataclass
 class BlendWeights:
-    """Weights for blending season / recency / decoherence components."""
+    """Weights for blending season/recency/decoherence components."""
     season: float = 0.45
     recency: float = 0.35
     decoherence: float = 0.20
@@ -81,16 +71,22 @@ class BlendWeights:
 class EntanglementConfig:
     """Correlation-based variance adjustment with shrinkage."""
     enabled: bool = True
-    shrinkage: float = 0.5  # 0=no shrink, 1=fully shrink to zero
+    shrinkage: float = 0.5  # 0=no shrink, 1=shrink strongly to 0
     variance_boost: float = 0.25
     min_games: int = 6
 
 
 @dataclass
 class PlayerPointsConfig:
-    """Bundle of tunable knobs for the player points model."""
+    """Tunable knobs for the player points model."""
     recent_window: int = 5
     min_history_games: int = 4
+
+    # Minutes handling / stability
+    minutes_clip_min: float = 0.0
+    minutes_clip_max: float = 55.0   # OT/outlier bugs exist in Eoin; cap them
+    minutes_alpha: float = 1.18      # nonlinear scaling (>1 boosts high-minute roles)
+
     decoherence: DecoherenceConfig = field(default_factory=DecoherenceConfig)
     weights: BlendWeights = field(default_factory=BlendWeights)
     entanglement: EntanglementConfig = field(default_factory=EntanglementConfig)
@@ -98,13 +94,16 @@ class PlayerPointsConfig:
 
     @classmethod
     def from_dict(cls, data: Dict) -> "PlayerPointsConfig":
+        base = cls()
         deco = data.get("decoherence", {})
         weights = data.get("weights", {})
         ent = data.get("entanglement", {})
-        base = cls()
         return cls(
             recent_window=int(data.get("recent_window", base.recent_window)),
             min_history_games=int(data.get("min_history_games", base.min_history_games)),
+            minutes_clip_min=float(data.get("minutes_clip_min", base.minutes_clip_min)),
+            minutes_clip_max=float(data.get("minutes_clip_max", base.minutes_clip_max)),
+            minutes_alpha=float(data.get("minutes_alpha", base.minutes_alpha)),
             decoherence=DecoherenceConfig(**deco) if not isinstance(deco, DecoherenceConfig) else deco,
             weights=(BlendWeights(**weights) if not isinstance(weights, BlendWeights) else weights).normalized(),
             entanglement=EntanglementConfig(**ent) if not isinstance(ent, EntanglementConfig) else ent,
@@ -115,6 +114,9 @@ class PlayerPointsConfig:
         return {
             "recent_window": self.recent_window,
             "min_history_games": self.min_history_games,
+            "minutes_clip_min": self.minutes_clip_min,
+            "minutes_clip_max": self.minutes_clip_max,
+            "minutes_alpha": self.minutes_alpha,
             "decoherence": asdict(self.decoherence),
             "weights": asdict(self.weights.normalized()),
             "entanglement": asdict(self.entanglement),
@@ -123,12 +125,11 @@ class PlayerPointsConfig:
 
 
 # ---------------------------------------------------------------------------
-# Low-level helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
 def _ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure df has a datetime64[ns] column named game_date."""
     if not isinstance(df, pd.DataFrame):
         raise TypeError(f"Expected a DataFrame, got {type(df)}")
 
@@ -142,43 +143,37 @@ def _ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
     raise KeyError("DataFrame must contain game_date or game_datetime.")
 
 
-def _as_1d_series(obj, index: pd.Index, name: str = "value") -> pd.Series:
-    """Coerce groupby/apply outputs into a 1D Series aligned to `index`."""
+def _as_1d_series(obj, index: pd.Index, name: str) -> pd.Series:
     if isinstance(obj, pd.DataFrame):
         s = obj.iloc[:, 0] if obj.shape[1] else pd.Series(index=index, dtype="float64", name=name)
     else:
         s = obj
-
     if not isinstance(s, pd.Series):
         s = pd.Series(s)
-
     if isinstance(s.index, pd.MultiIndex) and s.index.nlevels >= 2:
         try:
             s = s.droplevel(0)
         except Exception:
             pass
-
     s = s.reindex(index)
     s.name = name
     return s
 
 
 def _detect_minutes_column(df: pd.DataFrame) -> Optional[str]:
-    """Best-effort minutes column detection (case-insensitive)."""
     cols = {c.lower(): c for c in df.columns}
-
     preferred = [
         "minutes", "min", "mp", "mins", "minutes_played", "minutesplayed",
-        "minsplayed", "minutes_played_total",
+        "minsplayed", "numminutes",
     ]
     for key in preferred:
         if key in cols:
             return cols[key]
-
     for lc, orig in cols.items():
-        if "minute" in lc or (lc.endswith("min") and len(lc) <= 6):
+        if "minute" in lc:
             return orig
-
+        if lc.endswith("min") and len(lc) <= 8:
+            return orig
     return None
 
 
@@ -200,17 +195,14 @@ def _attach_team_totals(df: pd.DataFrame) -> pd.DataFrame:
         .sum()
         .rename(columns={"points": "team_points", "reboundstotal": "team_rebounds", "assists": "team_assists"})
     )
-
     merged = df.merge(team_totals, on=["game_id", "team_name"], how="left")
-    for col in ("team_points", "team_rebounds", "team_assists"):
-        merged[col] = merged[col].replace(0, np.nan)
-
+    merged["team_points"] = merged["team_points"].replace(0, np.nan)
     merged["points_share"] = _safe_div(merged["points"], merged["team_points"])
     return merged
 
 
 def _decoherence_prior_mean(group: pd.DataFrame, value_col: str, tau_days: float) -> pd.Series:
-    """NaN-safe exponential decay prior mean using only previous games."""
+    """Exponential-decay mean using only previous games."""
     values: list[float] = []
     dates: list[pd.Timestamp] = []
     results: list[float] = []
@@ -242,7 +234,7 @@ def _decoherence_prior_mean(group: pd.DataFrame, value_col: str, tau_days: float
 
 
 def _historical_variance(group: pd.DataFrame, value_col: str, tau_days: float) -> pd.Series:
-    """NaN-safe exponential decay prior variance using only previous games."""
+    """Exponential-decay variance using only previous games."""
     values: list[float] = []
     dates: list[pd.Timestamp] = []
     out: list[float] = []
@@ -283,7 +275,6 @@ def _shrink_correlation(corr: float, n: int, shrinkage: float) -> float:
 
 
 def _attach_team_context(player_games: pd.DataFrame, team_boxes: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Attach lightweight team context (team points in the game), dtype-hardened."""
     if team_boxes is None:
         return player_games
 
@@ -310,12 +301,22 @@ def _attach_team_context(player_games: pd.DataFrame, team_boxes: Optional[pd.Dat
 
 
 def _prior_rolling_mean(s: pd.Series, window: int) -> pd.Series:
-    """Leakage-safe rolling mean: shift(1) before rolling."""
     return s.shift(1).rolling(window=window, min_periods=1).mean()
 
 
+def _minutes_scaled(minutes: pd.Series, alpha: float) -> pd.Series:
+    """Scale minutes nonlinearly while preserving scale at 24 minutes."""
+    m = pd.to_numeric(minutes, errors="coerce").fillna(0.0)
+    alpha = float(alpha)
+    if not np.isfinite(alpha) or alpha <= 0:
+        alpha = 1.0
+    base = 24.0
+    ratio = (m / base).clip(lower=1e-6)
+    return m * (ratio ** (alpha - 1.0))
+
+
 # ---------------------------------------------------------------------------
-# Core public API
+# Public API
 # ---------------------------------------------------------------------------
 
 
@@ -335,7 +336,6 @@ def build_player_points_expectations(
         cfg = config
     else:
         cfg = PlayerPointsConfig.from_dict(config)
-
     cfg = PlayerPointsConfig.from_dict(cfg.to_dict())  # normalize weights
     np.random.seed(cfg.seed)
 
@@ -355,9 +355,16 @@ def build_player_points_expectations(
     minutes_col = _detect_minutes_column(df)
     if minutes_col is not None:
         df["minutes_actual"] = pd.to_numeric(df[minutes_col], errors="coerce")
-        df = df[df["minutes_actual"] >= float(min_minutes)].copy()
     else:
         df["minutes_actual"] = np.nan
+
+    df["minutes_actual"] = df["minutes_actual"].clip(
+        lower=float(cfg.minutes_clip_min),
+        upper=float(cfg.minutes_clip_max),
+    )
+
+    if min_minutes and min_minutes > 0:
+        df = df[df["minutes_actual"] >= float(min_minutes)].copy()
 
     if start_date is not None:
         df = df[df["game_date"] >= pd.to_datetime(start_date)]
@@ -379,8 +386,12 @@ def build_player_points_expectations(
 
     df["minutes_expected"] = _prior_rolling_mean(g["minutes_actual"], window=10)
 
-    global_min_med = float(pd.to_numeric(df["minutes_actual"], errors="coerce").median()) if df["minutes_actual"].notna().any() else 24.0
-    df["minutes_coherent"] = df["minutes_expected"].fillna(global_min_med).clip(lower=0, upper=48)
+    global_min_med = float(df["minutes_actual"].median()) if df["minutes_actual"].notna().any() else 24.0
+    df["minutes_coherent"] = (
+        df["minutes_expected"]
+        .fillna(global_min_med)
+        .clip(lower=float(cfg.minutes_clip_min), upper=float(cfg.minutes_clip_max))
+    )
 
     df["usage_coherent"] = _as_1d_series(
         g.apply(_decoherence_prior_mean, value_col="points_share", tau_days=cfg.decoherence.usage_tau),
@@ -399,12 +410,12 @@ def build_player_points_expectations(
     )
 
     weights = cfg.weights.normalized()
+    minutes_component = _minutes_scaled(df["minutes_coherent"], alpha=float(cfg.minutes_alpha)) * df["efficiency_coherent"]
 
-    comp_from_parts = df["minutes_coherent"] * df["efficiency_coherent"]
     df["predicted_points"] = (
         weights.season * df["season_mean_pts"]
         + weights.recency * df["recency_mean_pts"]
-        + weights.decoherence * comp_from_parts
+        + weights.decoherence * minutes_component
     )
     df["predicted_points"] = df["predicted_points"].fillna(df["recency_mean_pts"]).fillna(df["season_mean_pts"])
 
@@ -413,7 +424,6 @@ def build_player_points_expectations(
             df["team_id"] = df["teamid"]
         else:
             df["team_id"] = pd.NA
-
     df["team_id"] = pd.to_numeric(df["team_id"], errors="coerce").astype("Int64")
     df = _attach_team_context(df, team_boxes)
 
@@ -431,12 +441,13 @@ def build_player_points_expectations(
         corr_vals: list[float] = []
         pts_hist: list[float] = []
         team_hist: list[float] = []
+        min_n = int(cfg.entanglement.min_games)
         for _, row in sub.iterrows():
-            if len(pts_hist) >= int(cfg.entanglement.min_games):
+            if len(pts_hist) >= min_n:
                 pts = np.array(pts_hist, dtype="float64")
                 tm = np.array(team_hist, dtype="float64")
                 mask = np.isfinite(pts) & np.isfinite(tm)
-                if int(mask.sum()) >= int(cfg.entanglement.min_games):
+                if int(mask.sum()) >= min_n:
                     corr = float(np.corrcoef(pts[mask], tm[mask])[0, 1])
                     corr_vals.append(_shrink_correlation(corr, int(mask.sum()), float(cfg.entanglement.shrinkage)))
                 else:
@@ -465,23 +476,11 @@ def build_player_points_expectations(
         )
 
     out_cols = [
-        "game_id",
-        "player_id",
-        "team_id",
-        "team_name",
-        "game_date",
-        "points",
-        "predicted_points",
-        "predicted_variance",
-        "cum_games",
-        "season_mean_pts",
-        "recency_mean_pts",
-        "minutes_actual",
-        "minutes_expected",
-        "minutes_coherent",
-        "usage_coherent",
-        "efficiency_coherent",
-        "entanglement_corr",
+        "game_id", "player_id", "team_id", "team_name", "game_date",
+        "points", "predicted_points", "predicted_variance", "cum_games",
+        "season_mean_pts", "recency_mean_pts",
+        "minutes_actual", "minutes_expected", "minutes_coherent",
+        "usage_coherent", "efficiency_coherent", "entanglement_corr",
     ]
     out = df[out_cols].rename(columns={"points": "actual_points"}).copy()
 
@@ -544,9 +543,4 @@ def backtest_player_points(
             }
         )
 
-    return {
-        "mae": mae,
-        "bias": bias,
-        "calibration": calib_rows,
-        "predictions": preds,
-    }
+    return {"mae": mae, "bias": bias, "calibration": calib_rows, "predictions": preds}
