@@ -31,6 +31,9 @@ from typing import Any, Dict, Iterable, Optional, Union
 import numpy as np
 import pandas as pd
 
+import sys
+import time
+
 from qepc.utils.paths import get_project_root
 from .eoin_data_source import load_eoin_player_boxes, load_eoin_team_boxes
 
@@ -135,6 +138,72 @@ class PlayerPointsConfig:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+def _log(msg: str, enabled: bool) -> None:
+    """Print a stage message when progress is enabled."""
+    if enabled:
+        print(msg, flush=True)
+
+
+def _progress_iter(iterable, *, total: Optional[int] = None, desc: str = "", enabled: bool = False):
+    """Iterate with a progress bar (tqdm if available, else a simple text bar)."""
+    if not enabled:
+        for item in iterable:
+            yield item
+        return
+
+    try:
+        from tqdm import tqdm  # type: ignore
+        for item in tqdm(iterable, total=total, desc=desc):
+            yield item
+        return
+    except Exception:
+        pass
+
+    n = 0
+    t0 = time.time()
+    for item in iterable:
+        n += 1
+        if total:
+            pct = 100.0 * n / float(total)
+            elapsed = time.time() - t0
+            sys.stdout.write(f"\r{desc}: {n}/{total} ({pct:5.1f}%) elapsed={elapsed:6.1f}s")
+        else:
+            sys.stdout.write(f"\r{desc}: {n}")
+        sys.stdout.flush()
+        yield item
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _apply_by_group(
+    df: pd.DataFrame,
+    group_col: str,
+    fn,
+    *,
+    desc: str,
+    enabled: bool,
+) -> pd.Series:
+    """Apply `fn(group_df)->Series` per group and stitch results back to original index.
+
+    Used only to show progress for expensive per-player loops. When progress is
+    disabled, we fall back to pandas groupby.apply for speed.
+    """
+    if df.empty:
+        return pd.Series(index=df.index, dtype="float64")
+
+    out = np.full(len(df), np.nan, dtype="float64")
+    gb = df.groupby(group_col, sort=False)
+    total = int(getattr(gb, "ngroups", 0) or 0) if enabled else None
+
+    for _, grp in _progress_iter(gb, total=total, desc=desc, enabled=enabled):
+        res = fn(grp)
+        if not isinstance(res, pd.Series):
+            res = pd.Series(res, index=grp.index)
+        idx = grp.index.to_numpy(dtype=int, copy=False)
+        out[idx] = pd.to_numeric(res, errors="coerce").to_numpy(dtype="float64", copy=False)
+
+    return pd.Series(out, index=df.index)
 
 def _ensure_datetime(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame):
@@ -348,6 +417,7 @@ def build_player_points_expectations(
     end_date: Optional[Union[str, pd.Timestamp]] = None,
     min_minutes: int = 0,
     config: Optional[Union[PlayerPointsConfig, Dict[str, Any]]] = None,
+    progress: bool = False,
 ) -> pd.DataFrame:
     """Compute leakage-free per-game player points expectations."""
     if config is None:
@@ -360,6 +430,8 @@ def build_player_points_expectations(
     np.random.seed(cfg.seed)
 
     root = get_project_root()
+
+    _log("Stage 1/7: Loading Eoin boxscores…", progress)
 
     if player_boxes is None:
         player_boxes = load_eoin_player_boxes(root)
@@ -399,6 +471,8 @@ def build_player_points_expectations(
     # Harden points to numeric
     df["points_num"] = pd.to_numeric(df["points"], errors="coerce")
 
+    _log("Stage 2/7: Building leakage-safe rolling features…", progress)
+
     # ---- Season / recency features (leakage-safe) ----
     g = df.groupby("player_id", sort=False)
 
@@ -413,10 +487,23 @@ def build_player_points_expectations(
     df["minutes_expected"] = _prior_group_rolling_mean(df, "player_id", "minutes_actual", window=10)
 
     # optional smoother minutes prior (decoherence)
-    minutes_deco_raw = df.groupby("player_id", sort=False).apply(
-        _decoherence_prior_mean, value_col="minutes_actual", tau_days=cfg.decoherence.minutes_tau
-    )
-    df["minutes_decoherent"] = _as_1d_series(minutes_deco_raw, df.index, name="minutes_decoherent")
+    _log("Stage 3/7: Computing minutes coherence priors…", progress)
+
+    if progress:
+        df["minutes_decoherent"] = _apply_by_group(
+            df,
+            "player_id",
+            lambda sub: _decoherence_prior_mean(
+                sub, value_col="minutes_actual", tau_days=cfg.decoherence.minutes_tau
+            ),
+            desc="Minutes decoherence",
+            enabled=True,
+        )
+    else:
+        minutes_deco_raw = df.groupby("player_id", sort=False).apply(
+            _decoherence_prior_mean, value_col="minutes_actual", tau_days=cfg.decoherence.minutes_tau
+        )
+        df["minutes_decoherent"] = _as_1d_series(minutes_deco_raw, df.index, name="minutes_decoherent")
 
     global_min_med = float(df["minutes_actual"].median()) if df["minutes_actual"].notna().any() else 24.0
     w_m = float(np.clip(cfg.minutes_decoherence_weight, 0.0, 1.0))
@@ -444,27 +531,64 @@ def build_player_points_expectations(
     df["recency_ppm"] = _safe_div(df["recency_points_sum"], df["recency_minutes_sum"])
 
     # ---- Decoherence priors (usage/efficiency/variance) ----
-    df["usage_coherent"] = _as_1d_series(
-        df.groupby("player_id", sort=False).apply(
-            _decoherence_prior_mean, value_col="points_share", tau_days=cfg.decoherence.usage_tau
-        ),
-        df.index,
-        name="usage_coherent",
-    )
-    df["efficiency_coherent"] = _as_1d_series(
-        df.groupby("player_id", sort=False).apply(
-            _decoherence_prior_mean, value_col="points_per_min", tau_days=cfg.decoherence.efficiency_tau
-        ),
-        df.index,
-        name="efficiency_coherent",
-    )
-    df["variance_prior"] = _as_1d_series(
-        df.groupby("player_id", sort=False).apply(
-            _historical_variance, value_col="points_num", tau_days=cfg.decoherence.variance_tau
-        ),
-        df.index,
-        name="variance_prior",
-    )
+    _log("Stage 4/7: Computing decoherence priors (usage/efficiency/variance)…", progress)
+
+    if progress:
+        df["usage_coherent"] = _apply_by_group(
+            df,
+            "player_id",
+            lambda sub: _decoherence_prior_mean(
+                sub, value_col="points_share", tau_days=cfg.decoherence.usage_tau
+            ),
+            desc="Usage decoherence",
+            enabled=True,
+        )
+    else:
+        df["usage_coherent"] = _as_1d_series(
+            df.groupby("player_id", sort=False).apply(
+                _decoherence_prior_mean, value_col="points_share", tau_days=cfg.decoherence.usage_tau
+            ),
+            df.index,
+            name="usage_coherent",
+        )
+    if progress:
+        df["efficiency_coherent"] = _apply_by_group(
+            df,
+            "player_id",
+            lambda sub: _decoherence_prior_mean(
+                sub, value_col="points_per_min", tau_days=cfg.decoherence.efficiency_tau
+            ),
+            desc="Efficiency decoherence",
+            enabled=True,
+        )
+    else:
+        df["efficiency_coherent"] = _as_1d_series(
+            df.groupby("player_id", sort=False).apply(
+                _decoherence_prior_mean, value_col="points_per_min", tau_days=cfg.decoherence.efficiency_tau
+            ),
+            df.index,
+            name="efficiency_coherent",
+        )
+    if progress:
+        df["variance_prior"] = _apply_by_group(
+            df,
+            "player_id",
+            lambda sub: _historical_variance(
+                sub, value_col="points_num", tau_days=cfg.decoherence.variance_tau
+            ),
+            desc="Points variance prior",
+            enabled=True,
+        )
+    else:
+        df["variance_prior"] = _as_1d_series(
+            df.groupby("player_id", sort=False).apply(
+                _historical_variance, value_col="points_num", tau_days=cfg.decoherence.variance_tau
+            ),
+            df.index,
+            name="variance_prior",
+        )
+
+    _log("Stage 5/7: Blending priors into PPM + recomputing points…", progress)
 
     # ---- Prediction: blend in PPM-space, then scale by coherent minutes ----
     weights = cfg.weights.normalized()
@@ -524,9 +648,20 @@ def build_player_points_expectations(
             team_hist.append(pd.to_numeric(row.get("team_points_game"), errors="coerce"))
         return pd.Series(corr_vals, index=sub.index)
 
+    _log("Stage 6/7: Computing entanglement correlations…", progress)
+
     if cfg.entanglement.enabled and team_boxes is not None and "team_points_game" in df.columns:
-        corr_raw = df.groupby("player_id").apply(_compute_corr)
-        df["entanglement_corr"] = _as_1d_series(corr_raw, df.index, name="entanglement_corr")
+        if progress:
+            df["entanglement_corr"] = _apply_by_group(
+                df,
+                "player_id",
+                _compute_corr,
+                desc="Entanglement corr",
+                enabled=True,
+            )
+        else:
+            corr_raw = df.groupby("player_id").apply(_compute_corr)
+            df["entanglement_corr"] = _as_1d_series(corr_raw, df.index, name="entanglement_corr")
     else:
         df["entanglement_corr"] = 0.0
 
@@ -540,6 +675,8 @@ def build_player_points_expectations(
             * float(cfg.entanglement.variance_boost)
             * pd.to_numeric(df["team_points_prior_var"], errors="coerce").fillna(0.0)
         )
+
+    _log("Stage 7/7: Finalizing output…", progress)
 
     out_cols = [
         "game_id", "player_id", "team_id", "team_name", "game_date",
@@ -573,6 +710,7 @@ def backtest_player_points(
     minutes_affine_slope: Optional[float] = None,
     minutes_affine_intercept: Optional[float] = None,
     apply_insample_minutes_affine: bool = False,
+    progress: bool = False,
 ) -> Dict[str, Any]:
     """Run a backtest over the specified date range and return metrics + diagnostics.
 
@@ -599,6 +737,7 @@ def backtest_player_points(
         end_date=end_date,
         min_minutes=0,
         config=cfg,
+        progress=bool(progress),
     ).copy()
 
     # Apply evaluation filters AFTER predictions are computed.
