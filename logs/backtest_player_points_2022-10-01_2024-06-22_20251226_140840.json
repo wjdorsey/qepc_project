@@ -1,0 +1,120 @@
+{
+  "run_utc": "2025-12-26T22:21:51.034441Z",
+  "start": "2022-10-01",
+  "end": "2024-06-22",
+  "min_minutes": 10,
+  "progress": true,
+  "config": null,
+  "preds_file": null,
+  "result": {
+    "mae": 5.036919892509037,
+    "bias": -0.29552981607018364,
+    "calibration_actual_minutes": [
+      {
+        "bucket": "0-20 mins",
+        "n": 14289,
+        "mae": 3.93363694002054,
+        "bias": 0.8998578926898704,
+        "pred_mean": 6.545389420438488,
+        "actual_mean": 5.645531527748618
+      },
+      {
+        "bucket": "20-28 mins",
+        "n": 14077,
+        "mae": 4.923218572699598,
+        "bias": 0.10525610589869204,
+        "pred_mean": 10.349058052336144,
+        "actual_mean": 10.24380194643745
+      },
+      {
+        "bucket": "28-34 mins",
+        "n": 10760,
+        "mae": 5.461341465517554,
+        "bias": -0.7329597100311817,
+        "pred_mean": 14.604307947961384,
+        "actual_mean": 15.337267657992564
+      },
+      {
+        "bucket": "34-inf mins",
+        "n": 10311,
+        "mae": 6.278177526249115,
+        "bias": -2.0427912587050336,
+        "pred_mean": 19.469283224856213,
+        "actual_mean": 21.512074483561246
+      }
+    ],
+    "calibration_pred_minutes": [
+      {
+        "bucket": "0-20 mins",
+        "n": 15710,
+        "mae": 4.195454780845483,
+        "bias": -2.1701292076489223,
+        "pred_mean": 5.187668373509576,
+        "actual_mean": 7.357797581158498
+      },
+      {
+        "bucket": "20-28 mins",
+        "n": 14565,
+        "mae": 4.743630398012457,
+        "bias": -0.3203307287369752,
+        "pred_mean": 10.490929140813318,
+        "actual_mean": 10.811259869550291
+      },
+      {
+        "bucket": "28-34 mins",
+        "n": 11899,
+        "mae": 5.585539635232239,
+        "bias": 0.6388373846102139,
+        "pred_mean": 16.358813853221022,
+        "actual_mean": 15.719976468610808
+      },
+      {
+        "bucket": "34-inf mins",
+        "n": 7263,
+        "mae": 6.546372194989241,
+        "bias": 2.2782202064821715,
+        "pred_mean": 23.1514131019799,
+        "actual_mean": 20.873192895497727
+      }
+    ],
+    "applied_minutes_affine": null,
+    "mae_minutes_calibrated": NaN,
+    "bias_minutes_calibrated": NaN,
+    "calibration_actual_minutes_mincal": [],
+    "calibration_pred_minutes_mincal": [],
+    "mae_calibrated": NaN,
+    "bias_calibrated": NaN,
+    "applied_affine": null,
+    "calibration_actual_minutes_calibrated": [],
+    "calibration_pred_minutes_calibrated": [],
+    "diagnostics": {
+      "minutes": {
+        "mae": 5.115605511141072,
+        "bias": -1.0363160262572486
+      },
+      "minutes_scale": {
+        "slope": 0.6856061811511369,
+        "intercept": 8.699295045454441,
+        "corr": 0.7002384684931099,
+        "std_ratio": 1.0213421170115553
+      },
+      "minutes_calibrated": {},
+      "ppm": {
+        "mae": 0.17047648570082943,
+        "bias": -7.297569118963222e-05
+      },
+      "scale": {
+        "slope": 0.8098347430142326,
+        "intercept": 2.592348892176119,
+        "corr": 0.6770971046689415,
+        "std_pred": 7.28482257985521,
+        "std_actual": 8.712934055072957,
+        "std_ratio": 0.8360929319341912
+      }
+    },
+    "predictions": {
+      "saved_to": null
+    },
+    "points_base_col": "predicted_points_raw"
+  }
+}

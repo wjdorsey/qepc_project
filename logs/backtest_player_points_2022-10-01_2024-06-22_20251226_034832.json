@@ -1,0 +1,120 @@
+{
+  "run_utc": "2025-12-26T12:17:00.909771Z",
+  "start": "2022-10-01",
+  "end": "2024-06-22",
+  "min_minutes": 10,
+  "progress": true,
+  "config": null,
+  "preds_file": "C:\\Users\\wdors\\qepc_project\\logs\\backtest_player_points_preds_2022-10-01_2024-06-22_20251226_034832.parquet",
+  "result": {
+    "mae": 4.93607966041104,
+    "bias": -0.4516290001605682,
+    "calibration_actual_minutes": [
+      {
+        "bucket": "0-20 mins",
+        "n": 14289,
+        "mae": 3.8353803425287722,
+        "bias": 1.0158737060542469,
+        "pred_mean": 6.661405233802864,
+        "actual_mean": 5.645531527748618
+      },
+      {
+        "bucket": "20-28 mins",
+        "n": 14077,
+        "mae": 4.791553564479726,
+        "bias": 0.020303672021842974,
+        "pred_mean": 10.264105618459295,
+        "actual_mean": 10.24380194643745
+      },
+      {
+        "bucket": "28-34 mins",
+        "n": 10760,
+        "mae": 5.338251592511625,
+        "bias": -1.0337181783355518,
+        "pred_mean": 14.303549479657013,
+        "actual_mean": 15.337267657992564
+      },
+      {
+        "bucket": "34-inf mins",
+        "n": 10311,
+        "mae": 6.239058655294417,
+        "bias": -2.5221617165074277,
+        "pred_mean": 18.989912767053816,
+        "actual_mean": 21.512074483561246
+      }
+    ],
+    "calibration_pred_minutes": [
+      {
+        "bucket": "0-20 mins",
+        "n": 15898,
+        "mae": 4.104893661461001,
+        "bias": -1.9857460273033787,
+        "pred_mean": 5.298251959864818,
+        "actual_mean": 7.283997987168197
+      },
+      {
+        "bucket": "20-28 mins",
+        "n": 14988,
+        "mae": 4.669731201726022,
+        "bias": -0.2302729228487875,
+        "pred_mean": 10.397829559136799,
+        "actual_mean": 10.628102481985588
+      },
+      {
+        "bucket": "28-34 mins",
+        "n": 13025,
+        "mae": 5.581099922968443,
+        "bias": 0.40691174503549443,
+        "pred_mean": 16.779349364997106,
+        "actual_mean": 16.372437619961612
+      },
+      {
+        "bucket": "34-inf mins",
+        "n": 5526,
+        "mae": 6.5294268899203685,
+        "bias": 1.3379501537642813,
+        "pred_mean": 23.662416313735328,
+        "actual_mean": 22.324466159971045
+      }
+    ],
+    "applied_minutes_affine": null,
+    "mae_minutes_calibrated": NaN,
+    "bias_minutes_calibrated": NaN,
+    "calibration_actual_minutes_mincal": [],
+    "calibration_pred_minutes_mincal": [],
+    "mae_calibrated": NaN,
+    "bias_calibrated": NaN,
+    "applied_affine": null,
+    "calibration_actual_minutes_calibrated": [],
+    "calibration_pred_minutes_calibrated": [],
+    "diagnostics": {
+      "minutes": {
+        "mae": 5.02621224220241,
+        "bias": -1.282693815922851
+      },
+      "minutes_scale": {
+        "slope": 0.732560408687076,
+        "intercept": 7.7353276695601,
+        "corr": 0.6989200354873742,
+        "std_ratio": 0.9540783629571333
+      },
+      "minutes_calibrated": {},
+      "ppm": {
+        "mae": 0.16987639532278112,
+        "bias": -0.00010545429878921781
+      },
+      "scale": {
+        "slope": 0.8471739773932114,
+        "intercept": 2.2736081768726066,
+        "corr": 0.6861836675086399,
+        "std_pred": 7.057196283421633,
+        "std_actual": 8.712934055072957,
+        "std_ratio": 0.8099678293000165
+      }
+    },
+    "predictions": {
+      "saved_to": "C:\\Users\\wdors\\qepc_project\\logs\\backtest_player_points_preds_2022-10-01_2024-06-22_20251226_034832.parquet"
+    },
+    "points_base_col": "predicted_points_raw"
+  }
+}

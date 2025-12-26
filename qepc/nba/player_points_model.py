@@ -31,9 +31,6 @@ from typing import Any, Dict, Iterable, Optional, Union
 import numpy as np
 import pandas as pd
 
-
-import json
-from pathlib import Path
 import sys
 import time
 
@@ -96,13 +93,6 @@ class PlayerPointsConfig:
     # Minutes coherence blend (recency vs decoherence prior)
     minutes_decoherence_weight: float = 0.15  # small smoothing; keep it reactive
 
-
-    # Optional affine calibration for points (applied at the end)
-    # If slope/intercept are None, we will try to load them from a JSON file under PROJECT_ROOT.
-    points_affine_slope: Optional[float] = None
-    points_affine_intercept: Optional[float] = None
-    points_affine_clip_nonneg: bool = True
-    points_affine_file: Optional[str] = None  # e.g. 'qepc/nba/calibration/player_points_affine.json'
     decoherence: DecoherenceConfig = field(default_factory=DecoherenceConfig)
     weights: BlendWeights = field(default_factory=BlendWeights)
     entanglement: EntanglementConfig = field(default_factory=EntanglementConfig)
@@ -123,10 +113,6 @@ class PlayerPointsConfig:
             minutes_decoherence_weight=float(
                 data.get("minutes_decoherence_weight", base.minutes_decoherence_weight)
             ),
-            points_affine_slope=(None if data.get('points_affine_slope', None) is None else float(data.get('points_affine_slope'))),
-            points_affine_intercept=(None if data.get('points_affine_intercept', None) is None else float(data.get('points_affine_intercept'))),
-            points_affine_clip_nonneg=bool(data.get('points_affine_clip_nonneg', True)),
-            points_affine_file=(None if data.get('points_affine_file', None) in (None, '') else str(data.get('points_affine_file'))),
             decoherence=DecoherenceConfig(**deco) if not isinstance(deco, DecoherenceConfig) else deco,
             weights=(BlendWeights(**weights) if not isinstance(weights, BlendWeights) else weights).normalized(),
             entanglement=EntanglementConfig(**ent) if not isinstance(ent, EntanglementConfig) else ent,
@@ -141,10 +127,6 @@ class PlayerPointsConfig:
             "minutes_clip_max": self.minutes_clip_max,
             "minutes_alpha": self.minutes_alpha,
             "minutes_decoherence_weight": self.minutes_decoherence_weight,
-            "points_affine_slope": self.points_affine_slope,
-            "points_affine_intercept": self.points_affine_intercept,
-            "points_affine_clip_nonneg": self.points_affine_clip_nonneg,
-            "points_affine_file": self.points_affine_file,
             "decoherence": asdict(self.decoherence),
             "weights": asdict(self.weights.normalized()),
             "entanglement": asdict(self.entanglement),
@@ -161,91 +143,6 @@ def _log(msg: str, enabled: bool) -> None:
     """Print a stage message when progress is enabled."""
     if enabled:
         print(msg, flush=True)
-
-# ---------------------------------------------------------------------------
-# Points affine calibration (project-root relative)
-# ---------------------------------------------------------------------------
-
-_DEFAULT_POINTS_AFFINE_REL = Path("qepc/nba/calibration/player_points_affine.json")
-
-def load_points_affine_calibration(
-    root: Optional[Path] = None,
-    calibration_file: Optional[Union[str, Path]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Load an affine calibration for points from JSON.
-
-    Expected JSON shape:
-        {
-          "slope": 0.864218,
-          "intercept": 2.147546,
-          "clip_nonneg": true
-        }
-
-    - All paths are treated as PROJECT_ROOT-relative unless absolute.
-    - Returns None if the file doesn't exist or can't be parsed.
-    """
-    if root is None:
-        root = get_project_root()
-    root = Path(root)
-
-    candidates: list[Path] = []
-    if calibration_file:
-        p = Path(calibration_file)
-        candidates.append(p if p.is_absolute() else (root / p))
-
-    candidates.append(root / _DEFAULT_POINTS_AFFINE_REL)
-    candidates.append(root / Path("config/player_points_affine.json"))
-
-    for path in candidates:
-        try:
-            path = Path(path)
-            if not path.exists():
-                continue
-            data = json.loads(path.read_text(encoding="utf-8"))
-            slope = float(data.get("slope"))
-            intercept = float(data.get("intercept"))
-            clip_nonneg = bool(data.get("clip_nonneg", True))
-            if not np.isfinite(slope) or not np.isfinite(intercept):
-                continue
-            return {"slope": slope, "intercept": intercept, "clip_nonneg": clip_nonneg, "path": str(path)}
-        except Exception:
-            continue
-
-    return None
-
-
-def write_points_affine_calibration(
-    slope: float,
-    intercept: float,
-    *,
-    root: Optional[Path] = None,
-    calibration_file: Optional[Union[str, Path]] = None,
-    clip_nonneg: bool = True,
-    overwrite: bool = True,
-) -> Path:
-    """Write affine calibration JSON to a stable, repo-friendly location.
-
-    Default target:
-        PROJECT_ROOT/qepc/nba/calibration/player_points_affine.json
-    """
-    if root is None:
-        root = get_project_root()
-    root = Path(root)
-
-    target = Path(calibration_file) if calibration_file else _DEFAULT_POINTS_AFFINE_REL
-    target = target if target.is_absolute() else (root / target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    if target.exists() and not overwrite:
-        return target
-
-    payload = {
-        "slope": float(slope),
-        "intercept": float(intercept),
-        "clip_nonneg": bool(clip_nonneg),
-    }
-    target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return target
 
 
 def _progress_iter(iterable, *, total: Optional[int] = None, desc: str = "", enabled: bool = False):
@@ -587,7 +484,24 @@ def build_player_points_expectations(
     df["recency_mean_pts"] = _prior_group_rolling_mean(df, "player_id", "points_num", window=int(cfg.recent_window))
 
     # minutes expected (prior)
-    df["minutes_expected"] = _prior_group_rolling_mean(df, "player_id", "minutes_actual", window=10)
+    # minutes expected (prior) — **reactive** blend of last + short + long history (leakage-safe)
+    df["minutes_last"] = df.groupby("player_id", sort=False)["minutes_actual"].shift(1)
+    df["minutes_mean3"] = _prior_group_rolling_mean(df, "player_id", "minutes_actual", window=3)
+    df["minutes_mean10"] = _prior_group_rolling_mean(df, "player_id", "minutes_actual", window=10)
+
+    # Weighting rationale:
+    # - last game captures role changes quickly
+    # - 3-game mean smooths single-game noise
+    # - 10-game mean anchors long-run role
+    df["minutes_expected"] = (
+        0.60 * df["minutes_last"]
+        + 0.30 * df["minutes_mean3"]
+        + 0.10 * df["minutes_mean10"]
+    )
+    # minutes expected (prior)
+    df["minutes_expected"] = _prior_group_rolling_mean(
+        df, "player_id", "minutes_actual", window=int(cfg.recent_window)
+    )
 
     # optional smoother minutes prior (decoherence)
     _log("Stage 3/7: Computing minutes coherence priors…", progress)
@@ -707,11 +621,34 @@ def build_player_points_expectations(
         .fillna(df["efficiency_coherent"])
     )
 
-    df["predicted_points_raw"] = df["minutes_scaled"] * df["ppm_pred"]
+    df["predicted_points"] = df["minutes_scaled"] * df["ppm_pred"]
     # Final fallback: if minutes_scaled is 0/NaN, fall back to point-space priors
-    df["predicted_points_raw"] = df["predicted_points_raw"].fillna(df["recency_mean_pts"]).fillna(df["season_mean_pts"])
-    # By default, predicted_points mirrors the raw model output. It may be affine-calibrated later.
-    df["predicted_points"] = df["predicted_points_raw"]
+    df["predicted_points"] = df["predicted_points"].fillna(df["recency_mean_pts"]).fillna(df["season_mean_pts"])
+    # Keep both raw + calibrated outputs:
+    df["predicted_points_raw"] = pd.to_numeric(df["predicted_points"], errors="coerce")
+
+    # Optional: apply default affine calibration from a repo-relative JSON.
+    # This keeps behavior consistent across machines as long as the JSON is committed.
+    cal_path = root / "qepc" / "nba" / "calibration" / "player_points_affine.json"
+    if cal_path.exists():
+        try:
+            import json as _json
+
+            cal = _json.loads(cal_path.read_text(encoding="utf-8"))
+            slope = float(cal.get("slope", 1.0))
+            intercept = float(cal.get("intercept", 0.0))
+            clip_nonneg = bool(cal.get("clip_nonneg", True))
+
+            df["predicted_points"] = intercept + slope * df["predicted_points_raw"]
+            if clip_nonneg:
+                df["predicted_points"] = df["predicted_points"].clip(lower=0.0)
+
+            df["points_affine_slope"] = slope
+            df["points_affine_intercept"] = intercept
+        except Exception:
+            # If calibration file is malformed, fall back to raw predictions silently.
+            df["predicted_points"] = df["predicted_points_raw"]
+
 
     # ---- Team context + entanglement variance adjustment ----
     if "team_id" not in df.columns:
@@ -780,33 +717,6 @@ def build_player_points_expectations(
             * float(cfg.entanglement.variance_boost)
             * pd.to_numeric(df["team_points_prior_var"], errors="coerce").fillna(0.0)
         )
-
-    # Preserve raw variance before any affine calibration.
-    df["predicted_variance_raw"] = df["predicted_variance"]
-
-    # Optional points affine calibration (mean and variance).
-    # Priority order: explicit config values -> JSON file under PROJECT_ROOT.
-    slope = cfg.points_affine_slope
-    intercept = cfg.points_affine_intercept
-    clip_nonneg = bool(getattr(cfg, "points_affine_clip_nonneg", True))
-    cal_file = getattr(cfg, "points_affine_file", None)
-
-    if slope is None or intercept is None:
-        cal = load_points_affine_calibration(root, calibration_file=cal_file)
-        if cal is not None:
-            slope = float(cal["slope"])
-            intercept = float(cal["intercept"])
-            clip_nonneg = bool(cal.get("clip_nonneg", True))
-
-    if slope is not None and intercept is not None and np.isfinite(float(slope)) and np.isfinite(float(intercept)):
-        b = float(slope)
-        a = float(intercept)
-        pts = a + b * pd.to_numeric(df["predicted_points_raw"], errors="coerce")
-        if clip_nonneg:
-            pts = pts.clip(lower=0.0)
-        df["predicted_points"] = pts
-        # Variance scales with slope^2 under affine transform.
-        df["predicted_variance"] = (b ** 2) * pd.to_numeric(df["predicted_variance_raw"], errors="coerce")
 
     _log("Stage 7/7: Finalizing output…", progress)
 
@@ -882,10 +792,7 @@ def backtest_player_points(
     preds = preds.copy()
 
     preds = preds.dropna(subset=["predicted_points", "actual_points"])
-    if "predicted_points_raw" in preds.columns:
-        preds["predicted_points_raw"] = pd.to_numeric(preds["predicted_points_raw"], errors="coerce")
-    else:
-        preds["predicted_points_raw"] = pd.to_numeric(preds["predicted_points"], errors="coerce")
+    preds["predicted_points_raw"] = pd.to_numeric(preds["predicted_points"], errors="coerce")
     preds["actual_points"] = pd.to_numeric(preds["actual_points"], errors="coerce")
 
     if buckets is None:
