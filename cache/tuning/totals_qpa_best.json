@@ -1,0 +1,12 @@
+{
+  "tau_offense": 50.4283300173725,
+  "tau_defense": 47.04292089899268,
+  "tau_pace": 19.142218817130257,
+  "offense_weight": 0.6924366447192161,
+  "defense_weight": 0.3107573982898638,
+  "pace_weight": 0.03968259678114832,
+  "vegas_weight": 0.2534906847176956,
+  "entropy_shrink": 0.2956080889891188,
+  "corr_shrink": 0.22804549874287744,
+  "sample_size": 256
+}

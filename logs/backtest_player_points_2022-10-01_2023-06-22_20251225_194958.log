@@ -1,0 +1,29 @@
+Stage 1/7: Loading Eoin boxscores…
+Stage 2/7: Building leakage-safe rolling features…
+Stage 3/7: Computing minutes coherence priors…
+Stage 4/7: Computing decoherence priors (usage/efficiency/variance)…
+Stage 5/7: Blending priors into PPM + recomputing points…
+Stage 6/7: Computing entanglement correlations…
+Stage 7/7: Finalizing output…
+=== Player Points Backtest ===
+Date range: 2022-10-01 → 2023-06-22
+Min minutes filter: 10
+MAE:  4.949
+Bias: -0.536 (positive = over-predict)
+
+Affine calibration applied (points_cal = intercept + slope * points_pred):
+  slope=0.854 | intercept=2.266
+Calibrated MAE:  4.919
+Calibrated Bias: 0.000 (positive = over-predict)
+
+Calibration by ACTUAL minutes bucket:
+   0-20 mins | n= 7088 | MAE=3.845 | bias= 1.053 | pred= 6.71 | actual= 5.66
+  20-28 mins | n= 7070 | MAE=4.759 | bias=-0.013 | pred=10.14 | actual=10.15
+  28-34 mins | n= 5463 | MAE=5.341 | bias=-1.315 | pred=14.09 | actual=15.40
+ 34-inf mins | n= 5147 | MAE=6.315 | bias=-2.615 | pred=18.99 | actual=21.61
+
+Calibration by PREDICTED minutes bucket (minutes_coherent):
+   0-20 mins | n= 7864 | MAE=4.206 | bias=-2.093 | pred= 5.30 | actual= 7.39
+  20-28 mins | n= 7558 | MAE=4.659 | bias=-0.268 | pred=10.29 | actual=10.56
+  28-34 mins | n= 6512 | MAE=5.494 | bias= 0.340 | pred=16.45 | actual=16.11
+ 34-inf mins | n= 2834 | MAE=6.536 | bias= 1.056 | pred=23.79 | actual=22.73
