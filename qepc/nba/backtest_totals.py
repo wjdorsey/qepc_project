@@ -25,6 +25,7 @@ from qepc.utils.paths import get_project_root
 
 
 def _basic_expected_totals(games: pd.DataFrame, window: int = 10) -> pd.Series:
+    """Very simple leakage-safe baseline: team rolling for/against means."""
     df = games.sort_values("game_datetime").copy()
 
     for side, opp in (("home", "away"), ("away", "home")):
@@ -34,11 +35,11 @@ def _basic_expected_totals(games: pd.DataFrame, window: int = 10) -> pd.Series:
 
         df[f"{side}_for"] = (
             df.groupby(team_col)[scored_col]
-            .transform(lambda s: s.shift().rolling(window, min_periods=3).mean())
+            .transform(lambda s: s.shift(1).rolling(window, min_periods=3).mean())
         )
         df[f"{side}_against"] = (
             df.groupby(team_col)[opp_scored]
-            .transform(lambda s: s.shift().rolling(window, min_periods=3).mean())
+            .transform(lambda s: s.shift(1).rolling(window, min_periods=3).mean())
         )
 
     df["exp_home_pts"] = (df["home_for"] + df["away_against"]) / 2
@@ -47,9 +48,35 @@ def _basic_expected_totals(games: pd.DataFrame, window: int = 10) -> pd.Series:
 
 
 def _compute_metrics(actual: pd.Series, pred: pd.Series) -> dict:
-    mae = np.mean(np.abs(actual - pred))
-    bias = float(np.mean(pred - actual))
-    return {"mae": float(mae), "bias": bias}
+    actual = actual.astype(float)
+    pred = pred.astype(float)
+    mask = actual.notna() & pred.notna()
+    if mask.sum() == 0:
+        return {"mae": float("nan"), "bias": float("nan"), "n": 0}
+    mae = float(np.mean(np.abs(actual[mask] - pred[mask])))
+    bias = float(np.mean(pred[mask] - actual[mask]))
+    return {"mae": mae, "bias": bias, "n": int(mask.sum())}
+
+
+def _resolve_root(project_root: Optional[Path]) -> Path:
+    return Path(project_root) if project_root is not None else get_project_root()
+
+
+def _find_odds_csv(root: Path) -> Path:
+    """Locate the Kaggle odds CSV under PROJECT_ROOT (portable across machines)."""
+    candidate = root / "data" / "raw" / "nba" / "odds_long" / "nba_2008-2025.csv"
+    if candidate.exists():
+        return candidate
+
+    matches = list(root.rglob("nba_2008-2025.csv"))
+    if matches:
+        return matches[0]
+
+    raise FileNotFoundError(
+        f"NBA odds CSV not found under: {root}\n"
+        "Expected at: data/raw/nba/odds_long/nba_2008-2025.csv\n"
+        "Either place the file there or rerun the odds download notebook on this machine."
+    )
 
 
 def run_backtest(
@@ -58,46 +85,62 @@ def run_backtest(
     with_odds: bool = False,
     project_root: Optional[Path] = None,
 ) -> dict:
-    games = load_eoin_games(project_root=project_root).copy()
-    games["game_date"] = pd.to_datetime(games["game_date"])
+    root = _resolve_root(project_root)
 
+    games = load_eoin_games(project_root=root).copy()
+
+    # Standardize dates
+    games["game_date"] = pd.to_datetime(games["game_date"], errors="coerce")
     if start:
         games = games.loc[games["game_date"] >= pd.to_datetime(start)]
     if end:
         games = games.loc[games["game_date"] <= pd.to_datetime(end)]
 
-    games = games.sort_values("game_datetime")
-    games["total_actual"] = games["home_score"] + games["away_score"]
+    games = games.sort_values("game_datetime").reset_index(drop=True)
+    games["total_actual"] = games["home_score"].astype(float) + games["away_score"].astype(float)
 
+    # Baseline + QPA layers
     games["total_pred"] = _basic_expected_totals(games)
-    games["env_drift"] = compute_env_drift(games)
+    games["env_drift"] = compute_env_drift(games)  # must be leakage-safe internally
     games["total_pred_env"] = apply_env_drift(games["total_pred"], games["env_drift"])
     games["total_mix"] = apply_script_superposition(games)
 
-    metrics = {
+    metrics: dict = {
+        "rows": int(len(games)),
+        "date_min": str(games["game_date"].min().date()) if len(games) else None,
+        "date_max": str(games["game_date"].max().date()) if len(games) else None,
         "qepc_raw": _compute_metrics(games["total_actual"], games["total_pred"]),
         "qepc_env": _compute_metrics(games["total_actual"], games["total_pred_env"]),
         "qepc_script": _compute_metrics(games["total_actual"], games["total_mix"]),
     }
 
     if with_odds:
-        odds = load_long_odds(project_root=project_root)
+        odds_csv = _find_odds_csv(root)
+        odds = load_long_odds(odds_csv)
+
         merged, diag = attach_odds_to_games(games, odds)
+
+        # Posterior collapse only meaningful where Vegas totals exist
         merged["total_posterior"] = collapse_total_with_odds(
-            merged, qepc_col="total_mix", vegas_col="total_points"
+            merged, qepc_col="total_mix", vegas_col="total_points", actual_col="total_actual"
         )
-        overlap = merged[merged["total_points"].notna()]
+        overlap = merged[merged["total_points"].notna()].copy()
+
+        metrics["odds_overlap_rows"] = int(len(overlap))
         metrics["vegas"] = _compute_metrics(overlap["total_actual"], overlap["total_points"])
-        metrics["posterior"] = _compute_metrics(
-            overlap["total_actual"], overlap["total_posterior"]
-        )
+        metrics["posterior"] = _compute_metrics(overlap["total_actual"], overlap["total_posterior"])
+
+        # Coverage diagnostics if present
         metrics["coverage"] = {
-            "matched_rows": int(diag.matched_rows),
-            "overlap_matched": int(diag.overlap_matched),
-            "overlap_games": int(diag.overlap_games),
+            "matched_rows": int(getattr(diag, "matched_rows", np.nan)),
+            "total_games": int(getattr(diag, "total_games", np.nan)),
+            "overlap_games": int(getattr(diag, "overlap_games", np.nan)),
+            "overlap_matched": int(getattr(diag, "overlap_matched", np.nan)),
         }
-        dist = overdispersed_total_distribution(merged)
-        metrics["entropy_mean"] = float(dist.entropy_bits.mean())
+
+        # Optional distribution stats (may be slow; still deterministic)
+        dist = overdispersed_total_distribution(merged, pred_col="total_mix", actual_col="total_actual")
+        metrics["entropy_mean_bits"] = float(dist.entropy_bits.mean())
 
     return metrics
 
@@ -110,11 +153,19 @@ def main() -> None:
     parser.add_argument("--project-root", type=str, default=None)
     args = parser.parse_args()
 
-    root = Path(args.project_root).expanduser() if args.project_root else get_project_root()
+    root = Path(args.project_root).expanduser() if args.project_root else None
     metrics = run_backtest(args.start, args.end, args.with_odds, project_root=root)
 
-    for name, m in metrics.items():
-        print(f"[{name}] {m}")
+    # Pretty print in a stable order
+    print("[backtest_totals] rows:", metrics.get("rows"))
+    print("[backtest_totals] date range:", metrics.get("date_min"), "→", metrics.get("date_max"))
+    for k in ("qepc_raw", "qepc_env", "qepc_script", "vegas", "posterior"):
+        if k in metrics:
+            print(f"[{k}] {metrics[k]}")
+    if "coverage" in metrics:
+        print("[coverage]", metrics["coverage"])
+    if "entropy_mean_bits" in metrics:
+        print("[entropy_mean_bits]", round(metrics["entropy_mean_bits"], 4))
 
 
 if __name__ == "__main__":
